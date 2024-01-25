@@ -1,0 +1,1 @@
+Analysis to support work reported in "Causal estimation of long-term intervention cost-effectiveness using genetic instrumental variables: An application to cancer", published in Medical Decision Making in 2024. 
