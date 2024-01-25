@@ -1,0 +1,3718 @@
+*Estimating the healthcare costs and QALY costs of different cancers
+*Written by Sean Harrison, September 2019 - August 2022
+*Analysis to support work reported in "Causal estimation of long-term intervention cost-effectiveness using genetic instrumental variables: An application to cancer", published in Medical Decision Making in 2024. 
+*Research paper also preprinted here: doi: https://doi.org/10.1101/2023.02.06.23285521
+
+global cd_folder "M:..."
+global cd_phenotype_folder "M:..."
+
+global cd_folder "C:... "
+
+global cd_data "$cd_folder\Stata\data"
+global cd_stata_code "$cd_folder\Stata\do\Automated"
+global cd_tables "$cd_folder\Stata\tables"
+global cd_prs_data "$cd_folder\Stata\data\R"
+global cd_r_code "$cd_folder\Stata\do\R"
+global cd_automated_code "$cd_folder\Stata\do\Automated"
+global cd_gwas "$cd_folder\Stata\data\GWAS"
+global cd_phenotype_data "$cd_phenotype_folder\34510 (2019-07-15 download)"
+global cd_primary_care_data "$cd_phenotype_folder\PRIMARY CARE\clinical"
+global cd_graphs "$cd_folder\Stata\graphs"
+
+cd "$cd_data"
+
+*Parts 0 to IVc - Data processing & variable creation
+{
+
+*Part 0
+*Install packages
+{
+/*
+*Running R from Stata
+ssc install rsource, replace
+
+Use this code to run R scripts
+if "`c(os)'"=="MacOSX" | "`c(os)'"=="UNIX" {
+    rsource using my_script.R, rpath("/usr/local/bin/R") roptions(`"--vanilla"')
+}
+else {  // windows
+    rsource using my_script.R, rpath(`"C:\Program Files\R\R-3.5.1\bin\R.exe"') roptions(`"--vanilla"')  // change version number, if necessary
+}
+
+*IV regression
+ssc install ivreg2
+ssc install ranktest
+
+*MR analysis (MR robust)
+net install mrrobust, from(https://raw.github.com/remlapmot/mrrobust/master/) replace
+mrdeps
+
+*/
+}
+
+*Part I
+*Create and combine all initial data
+{
+
+*Do ONCE
+*Load in phenotypes
+
+forvalues i = 1/51 {
+	clear all
+	set maxvar 15000
+	
+	*Excel code from "Phenotypes.xlsx" goes here
+	use n_eid  n_31_0_0  n_34_0_0  ts_53_0_0  n_54_0_0  n_189_0_0  n_738_0_0  n_6138_0_0 n_20001_*  n_20160_0_0  n_21001_0_0  n_21003_0_0  n_22000_0_0  n_22009_0_*  ts_40000_0_0  using "$cd_phenotype_data\y\y`i'.dta"
+
+	save "z`i'.dta", replace	
+
+}
+
+use "z1.dta", clear
+forvalues i = 2/51 {
+	append using "z`i'.dta"
+}
+
+compress
+
+save "Phenotype_data.dta", replace
+
+*Import GRS and combine with phenotypes
+import delimited "R\grs_cancer.csv", clear
+
+*Clean names
+rename bladder_cancer bladder
+
+rename breast_cancer_combined_oncoarray breast
+rename v11 breast_er_pos
+rename er_breast_cancer_combined_oncoar breast_er_neg
+
+rename colorectal_cancer colorectal
+
+rename cutaneous_squamous_cell_carcinom cutaneous
+
+rename multiple_myeloma multiple_myeloma
+
+rename prostate_cancer_overall__id1174 prostate
+
+rename thyroid_cancer thyroid
+
+rename lung_cancer__id966 lung
+rename lung_adenocarcinoma__id965 lung_adeno
+rename squamous_cell_lung_cancer__id967 lung_squa
+
+rename ovarian_cancer__id1120 ovarian 
+rename low_malignant_potential_ovarian_ ovarian_lmp
+rename clear_cell_ovarian_cancer__id112 ovarian_clear_cell
+rename high_grade_and_low_grade_serous_ ovarian_s_hlg
+rename high_grade_serous_ovarian_cancer ovarian_s_hg 
+rename serous_ovarian_cancer_low_grade_ ovarian_s_lg_lmp
+rename serous_ovarian_cancer_low_malign ovarian_s_lmp
+rename invasive_mucinous_ovarian_cancer ovarian_m_inv
+rename mucinous_ovarian_cancer_invasive ovarian_m_inv_lmp
+rename low_malignant_potential_mucinous ovarian_m_lmp
+
+*Can't get good ICD codes for these, so drop
+drop neuroblastoma__id816 
+drop nonglioblastoma_glioma 
+drop cutaneous
+
+foreach var of varlist _all {
+	if "`var'" == "id" {
+		rename `var' id_ieu
+	}
+	else {
+		rename `var' grs_`var'
+	}
+}
+
+order *, alpha
+order id 
+
+*Merge to phenotypic IDs
+merge 1:1 id_ieu using "linker.dta", keep(3) nogen
+save "grs_cancer.dta", replace
+
+***
+
+*Create main dataset
+use "Phenotype_data.dta", clear
+rename n_eid id_phe
+
+*Remove withdrawals
+merge 1:1 id_phe using "withdrawals.dta", keep(1) nogen
+
+*Remove non-white British participants
+merge 1:1 id_phe using "linker.dta", keep(3) nogen
+foreach var in _non_white_british {
+	merge 1:1 id_ieu using "exclusions`var'.dta", keep(1) nogen
+}
+
+*Merge with genetic data
+merge 1:1 id_phe using "$cd_data\grs_cancer.dta", keep(3) nogen
+
+*Remove recommended drops
+foreach var in _recommended _highly_related {
+	merge 1:1 id_ieu using "exclusions`var'.dta", keep(1) nogen
+}
+
+*Remove Scottish participants (costs are separate in Scotland)
+drop if n_54_0_0 == 11004 | n_54_0_0 == 11005
+
+*Mark relateds 
+merge 1:1 id_ieu using "exclusions_relateds.dta"
+gen related = 1 if _merge != 1
+replace related = 0 if related == .
+drop if _merge == 2
+drop _merge
+
+compress
+
+order id*
+
+save "$cd_data\part_1.dta", replace
+
+}
+
+*Part II
+*HES data (only run once)
+{
+
+use "part_1.dta", clear
+
+*Deal with HES, then import
+*Generate a list of IDs with registration dates for UK Biobank 
+keep id_phe ts_53_
+save "date_attending.dta", replace
+
+use "$cd_phenotype_folder\HES\hes_v2.dta", clear
+
+rename eid id_phe
+keep id_phe ins_index epistart diag_icd10* diag_icd9*
+merge m:1 id_phe using "date_attending.dta", keep(3) nogen
+order ts_53, a(epistart)
+rename ts_53_0_0 date_baseline
+rename epistart date_episode
+
+*Generate health condition phenotypes
+forvalues i = 1/9 {
+	gen v`i' = .
+	format v`i' %td
+}
+
+*Loop through HES diagnosis fields to find & tag relevant ICD9 & ICD10 codes
+
+forvalues i = 0/19 { 
+	local j = `i'+1
+	dis "Looking through `j' of 20 diagnosis fields for ICD9 & ICD10 codes"
+	*ICD9
+	qui replace v1 = date_episode if substr(diag_icd9_`i',1,3) == "174"
+	qui replace v2 = date_episode if substr(diag_icd9_`i',1,3) == "162"
+	qui replace v3 = date_episode if substr(diag_icd9_`i',1,3) == "153"
+	qui replace v3 = date_episode if substr(diag_icd9_`i',1,3) == "154"
+	qui replace v4 = date_episode if substr(diag_icd9_`i',1,3) == "185"
+	qui replace v5 = date_episode if substr(diag_icd9_`i',1,3) == "188"
+	qui replace v6 = date_episode if substr(diag_icd9_`i',1,3) == "193"
+	qui replace v7 = date_episode if substr(diag_icd9_`i',1,4) == "2300"
+	qui replace v8 = date_episode if substr(diag_icd9_`i',1,3) == "191"
+	qui replace v9 = date_episode if substr(diag_icd9_`i',1,4) == "1830"
+
+	*ICD10
+	qui replace v1 = date_episode if strpos(diag_icd10_`i',"C50") > 0
+	qui replace v2 = date_episode if strpos(diag_icd10_`i',"C33") > 0
+	qui replace v2 = date_episode if strpos(diag_icd10_`i',"C34") > 0
+	qui replace v3 = date_episode if strpos(diag_icd10_`i',"C18") > 0
+	qui replace v3 = date_episode if strpos(diag_icd10_`i',"C19") > 0
+	qui replace v3 = date_episode if strpos(diag_icd10_`i',"C20") > 0
+	qui replace v3 = date_episode if strpos(diag_icd10_`i',"C21") > 0
+	qui replace v4 = date_episode if strpos(diag_icd10_`i',"C61") > 0
+	qui replace v5 = date_episode if strpos(diag_icd10_`i',"C67") > 0
+	qui replace v6 = date_episode if strpos(diag_icd10_`i',"C73") > 0
+	qui replace v7 = date_episode if strpos(diag_icd10_`i',"C900") > 0
+	qui replace v8 = date_episode if strpos(diag_icd10_`i',"C71") > 0
+	qui replace v9 = date_episode if strpos(diag_icd10_`i',"C56") > 0
+
+}	
+
+label variable v1 "Malignant neoplasm of female breast"
+label variable v2 "Malignant neoplasm of trachea bronchus and lung"
+label variable v3 "Malignant neoplasm of colon, rectum, rectosigmoid junction and anus"
+label variable v4 "Malignant neoplasm of prostate"
+label variable v5 "Malignant neoplasm of bladder"
+label variable v6 "Malignant neoplasm of thyroid gland"
+label variable v7 "Multiple myeloma"
+label variable v8 "Malignant neoplasm of brain"
+label variable v9 "Malignant neoplasm of ovary"
+
+drop diag* date_episode
+
+*Replace all v`i' values with the minimum, so when duplicates are dropped, any instance of the ICD code is kept
+forvalues i = 1/9 {
+	dis "Sorting through `i' of 9 variables"
+	qui {
+		bysort id_phe: egen x = min(v`i')
+	}
+	qui replace v`i' = x
+	qui drop x
+}
+
+*Keep only a single row per participant
+duplicates drop id_phe, force
+
+save "hes_icd.dta", replace
+
+*Merge
+use "part_1.dta", clear
+merge 1:1 id_phe using "hes_icd.dta", nogen keep(1 3)
+
+*Rename some variables
+rename n_31_0 sex
+drop n_34
+rename n_54_ centre
+rename n_189_ eco_tdi
+rename n_738_ eco_household_income
+rename n_6138_ eco_qualifications
+rename n_20160_ ever_smoked
+rename n_21001 phe_bmi
+rename n_21003_ age
+drop n_22000
+forvalues i = 1/40 {
+	rename n_22009_0_`i' pc`i'
+}
+replace date_baseline = ts_53_ if date_baseline == .
+drop ts_53_
+rename ts_40000_ date_death
+
+*Make qualifications into dummy variables
+forvalues i = 1/3 {
+	gen qual_`i' = 0
+}
+*Assume everyone who prefered not to answer and missing responses have no qualifications
+
+*High school = A levels, O levels, CSEs & GCSEs
+replace qual_1 = 1 if eco_qualifications == 2 | eco_qualifications == 3 | eco_qualifications == 4
+*Other degree = NVQs and other
+replace qual_2 = 1 if eco_qualifications == 5 | eco_qualifications == 6
+*Bachelor degree = College or university degree
+replace qual_3 = 1 if eco_qualifications == 1
+*Not coding ma_phd
+
+*Remove all participants who died before entry
+qui drop if date_death < date_baseline
+
+*Code the self-reported cancers
+*Loop through self-reported cancer fields to find & tag relevant codes
+forvalues i = 1/9 {
+	qui gen b`i' = 0
+}
+
+forvalues i = 0/5 { 
+	local j = `i'+1
+	dis "Looking through `j' of 6 cancer fields for UKB codes"
+	qui replace b1 = 1 if n_20001_0_`i' == 1002 & sex == 0
+	qui replace b2 = 1 if n_20001_0_`i' == 1001 | n_20001_0_`i' == 1027 | n_20001_0_`i' == 1025
+	qui replace b3 = 1 if n_20001_0_`i' == 1020 | n_20001_0_`i' == 1021 | n_20001_0_`i' == 1022
+	qui replace b4 = 1 if n_20001_0_`i' == 1044
+	qui replace b5 = 1 if n_20001_0_`i' == 1035
+	qui replace b6 = 1 if n_20001_0_`i' == 1065
+	qui replace b7 = 1 if n_20001_0_`i' == 1050
+	qui replace b8 = 1 if n_20001_0_`i' == 1032
+	qui replace b9 = 1 if n_20001_0_`i' == 1039
+}	
+
+*The v[] variables are the dates of cancer occurence from HES, but add in date_baseline-1 for any self-reported cancers
+*This overwrites the HES date if the HES date is after baseline
+forvalues i = 1/9 {
+	qui replace v`i' = date_baseline - 1 if b`i' == 1 & v`i' >= date_baseline
+}
+label variable v1 "Date: malignant neoplasm of female breast"
+label variable v2 "Date: malignant neoplasm of trachea bronchus and lung"
+label variable v3 "Date: malignant neoplasm of colon, rectum, rectosigmoid junction and anus"
+label variable v4 "Date: malignant neoplasm of prostate"
+label variable v5 "Date: malignant neoplasm of bladder"
+label variable v6 "Date: malignant neoplasm of thyroid gland"
+label variable v7 "Date: multiple myeloma"
+label variable v8 "Date: malignant neoplasm of brain"
+label variable v9 "Date: malignant neoplasm of ovary"
+
+*The a[] variables are for any cases of cancer, from HES or baseline
+forvalues i=1/9 {
+	qui gen a`i' = 0 
+	qui replace a`i' = 1 if v`i' < .
+	qui replace a`i' = 1 if b`i' == 1
+}
+label variable a1 "Any malignant neoplasm of female breast"
+label variable a2 "Any malignant neoplasm of trachea bronchus and lung"
+label variable a3 "Any malignant neoplasm of colon, rectum, rectosigmoid junction and anus"
+label variable a4 "Any malignant neoplasm of prostate"
+label variable a5 "Any malignant neoplasm of bladder"
+label variable a6 "Any malignant neoplasm of thyroid gland"
+label variable a7 "Any multiple myeloma"
+label variable a8 "Any malignant neoplasm of brain"
+label variable a9 "Any malignant neoplasm of ovary"
+
+*The b[] variables are for baseline cases of cancer, so add in anything from HES
+forvalues i=1/9 {
+	qui replace b`i' = 1 if v`i' <= date_baseline
+}
+label variable b1 "Baseline malignant neoplasm of female breast"
+label variable b2 "Baseline malignant neoplasm of trachea bronchus and lung"
+label variable b3 "Baseline malignant neoplasm of colon, rectum, rectosigmoid junction and anus"
+label variable b4 "Baseline malignant neoplasm of prostate"
+label variable b5 "Baseline malignant neoplasm of bladder"
+label variable b6 "Baseline malignant neoplasm of thyroid gland"
+label variable b7 "Baseline multiple myeloma"
+label variable b8 "Baseline malignant neoplasm of brain"
+label variable b9 "Baseline malignant neoplasm of ovary"
+
+*The c[] variables are for cases of cancer occurring after baseline (in HES)
+forvalues i=1/9 {
+	qui gen c`i' = 0 
+	qui replace c`i' = 1 if v`i' > date_baseline & v`i' < .
+}
+label variable c1 "Post-baseline malignant neoplasm of female breast"
+label variable c2 "Post-baseline malignant neoplasm of trachea bronchus and lung"
+label variable c3 "Post-baseline malignant neoplasm of colon, rectum, rectosigmoid junction and anus"
+label variable c4 "Post-baseline malignant neoplasm of prostate"
+label variable c5 "Post-baseline malignant neoplasm of bladder"
+label variable c6 "Post-baseline malignant neoplasm of thyroid gland"
+label variable c7 "Post-baseline multiple myeloma"
+label variable c8 "Post-baseline malignant neoplasm of brain"
+label variable c9 "Post-baseline malignant neoplasm of ovary"
+
+order a1-a9 b1-b9 c1-c9 v1-v9, last
+
+foreach x in a b c v {
+	rename `x'1 `x'_breast
+	rename `x'2 `x'_lung
+	rename `x'3 `x'_colorectal
+	rename `x'4 `x'_prostate
+	rename `x'5 `x'_bladder
+	rename `x'6 `x'_thyroid
+	rename `x'7 `x'_multiple
+	rename `x'8 `x'_brain
+	rename `x'9 `x'_ovarian
+}
+
+save "part_2.dta", replace
+
+}
+
+*PRIMARY CARE data - not used, does not add >1% of cases,and but given primary care only covers 31% of the population, much simpler to work from HES and self-reported cancers
+
+*Add in costs and QALYs from previous imputations
+*Part III
+{
+use "part_2.dta", clear
+
+merge 1:1 id_phe id_ieu using "Costs & QALYs.dta", keep(3) nogen
+
+drop n_20001* related ins_index qual_1 qual_2 qual_3 date_death
+rename eco_tdi cov_tdi
+rename eco_household_income cov_household_income
+rename eco_qualifications cov_qualifications
+rename ever_smoked cov_ever_smoked
+rename phe_bmi cov_bmi
+
+order id* age sex centre pc* cov*
+
+replace cov_household_income = 6 if cov_household_income == -3
+replace cov_household_income = 7 if cov_household_income == -1
+label define m_100294 6 "Prefer not to answer" 7 "Do not know", add
+
+replace cov_qualifications = 7 if cov_qualifications == -7
+replace cov_qualifications = 8 if cov_qualifications == -3
+label define m_100305 7 "None of the above" 8 "Prefer not to answer", add
+
+gen age_group = 1 if age <50
+replace age_group = 2 if age < 60 & age_group == .
+replace age_group = 3 if age >= 60 & age < .
+
+save "part 3.dta", replace
+
+}
+
+}
+
+*Parts IV to VI - Analysis
+{
+
+*Part IV
+*Main analysis (local Stata version with 3 outcomes)
+{
+*IV REG
+
+*ssc install ivreg2
+*ssc install ranktest
+
+use "part 3.dta", clear
+
+*Create table
+gen touse = .
+gen exposure = ""
+gen exposure_time = ""
+gen outcome = ""
+gen type = ""
+gen sex_ = ""
+gen age_ = ""
+
+gen imputation = .
+gen n = .
+gen beta = .
+gen variance = .
+gen se = .
+gen double p = .
+gen double p_endog = .
+gen f_stat = .
+
+*Number of imputations
+local m = 100
+
+local outcomes = "cost primary_care_cost qaly qaly_cost_10k qaly_cost_20k qaly_cost_30k"
+
+forvalues j = 0/`m' {
+	local x = 1
+	foreach sex in all male female {
+		foreach age in all 1 2 3 {
+			foreach time in a b c {
+				foreach grs of varlist grs_* {
+					foreach var in `outcomes' {
+						*Skip analysis for sex-specific cancers, except for their specific sex
+						if ((strpos("`grs'","ovarian") > 0 | strpos("`grs'","breast") > 0) & "`sex'" != "female") | (strpos("`grs'","prostate") > 0 & "`sex'" != "male") {
+							dis "Outcome = `var', imputation = `j', grs = `grs', time = `time', age = `age', sex = `sex'"
+							dis "Analysis skipped"
+						} 
+						else {
+							dis "Outcome = `var', imputation = `j', grs = `grs', time = `time', age = `age', sex = `sex'"
+							
+							*Peg the PRS to the right exposure
+							local exposure = substr("`grs'",5,4)
+							local exposure = "`time'_`exposure'"
+							
+							*touse
+							qui replace touse = 1
+							
+							if "`sex'" == "male" {
+								qui replace touse = . if sex == 0
+							}
+							if "`sex'" == "female" {
+								qui replace touse = . if sex == 1
+							}
+							
+							if "`age'" != "all" {
+								qui replace touse = . if age_group != `age'
+							}
+							
+
+							*MR analysis
+							capture ivreg2 `var'_`j' (`exposure' = `grs') age sex pc* i.centre if touse == 1, robust endog(`exposure') 
+							
+							*Check the analysis ran - if it didn't, state this, otherwise add in data
+							if _rc {
+								qui replace exposure = "`grs'" in `x'
+								if "`time'" == "a" {
+									qui replace exposure_time = "Any" in `x'
+								}
+								else if "`time'" == "b" {
+									qui replace exposure_time = "Pre-baseline" in `x'
+								}
+								else {
+									qui replace exposure_time = "Post-baseline" in `x'
+								}
+								qui replace outcome = "`var'" in `x'
+								qui replace type = "Analysis not possible" in `x'
+								qui replace sex_ = "`sex'" in `x'
+								qui replace age_ = "`age'" in `x'
+								local x = `x' + 1
+							}
+							
+							else {
+								matrix a = e(b)
+								matrix b = e(V)
+								local beta = a[1,1]
+								local variance = b[1,1]
+								
+								local n = e(N)
+								local f_stat = e(widstat)
+								local p_endog = e(estatp)
+								
+								qui replace exposure = "`grs'" in `x'
+								if "`time'" == "a" {
+									qui replace exposure_time = "Any" in `x'
+								}
+								else if "`time'" == "b" {
+									qui replace exposure_time = "Pre-baseline" in `x'
+								}
+								else {
+									qui replace exposure_time = "Post-baseline" in `x'
+								}
+								qui replace outcome = "`var'" in `x'
+								qui replace type = "Main Analysis MR" in `x'
+								qui replace sex_ = "`sex'" in `x'
+								qui replace age_ = "`age'" in `x'
+								qui replace imputation = `j' in `x'
+								foreach z in beta variance n p_endog f_stat {
+									qui replace `z' = ``z'' in `x'
+								}
+								
+								local x = `x' + 1
+								
+								*Linear regression
+								qui reg `var'_`j' `exposure' age sex pc* i.centre if touse == 1
+								
+								matrix a = e(b)
+								matrix b = e(V)
+								local reg_beta = a[1,1]
+								local reg_variance = b[1,1]
+								
+								local reg_n = e(N)
+								
+								*Linear regression estimates
+								qui replace exposure = "`grs'" in `x'
+								qui replace exposure_time = "Any" in `x'
+								if "`time'" == "a" {
+									qui replace exposure_time = "Any" in `x'
+								}
+								else if "`time'" == "b" {
+									qui replace exposure_time = "Pre-baseline" in `x'
+								}
+								else {
+									qui replace exposure_time = "Post-baseline" in `x'
+								}
+								qui replace outcome = "`var'" in `x'
+								qui replace type = "Multivariable Adjusted" in `x'
+								qui replace sex_ = "`sex'" in `x'
+								qui replace age_ = "`age'" in `x'
+								qui replace imputation = `j' in `x'
+								foreach z in beta variance n {
+									qui replace `z' = `reg_`z'' in `x'
+								}
+								
+								local x = `x' + 1
+								
+								*Linear regression (more variables)
+								qui reg `var'_`j' `exposure' age sex pc* i.centre cov_tdi i.cov_household_income i.cov_qualifications cov_ever_smoked cov_bmi if touse == 1
+								
+								matrix a = e(b)
+								matrix b = e(V)
+								local reg_beta = a[1,1]
+								local reg_variance = b[1,1]
+								
+								local reg_n = e(N)
+								
+								*Linear regression estimates
+								qui replace exposure = "`grs'" in `x'
+								if "`time'" == "a" {
+									qui replace exposure_time = "Any" in `x'
+								}
+								else if "`time'" == "b" {
+									qui replace exposure_time = "Pre-baseline" in `x'
+								}
+								else {
+									qui replace exposure_time = "Post-baseline" in `x'
+								}
+								qui replace outcome = "`var'" in `x'
+								qui replace type = "Multivariable Adjusted - additional variables" in `x'
+								qui replace sex_ = "`sex'" in `x'
+								qui replace age_ = "`age'" in `x'
+								qui replace imputation = `j' in `x'
+								foreach z in beta variance n {
+									qui replace `z' = `reg_`z'' in `x'
+								}
+								
+								local x = `x' + 1
+							}
+						}						
+					}
+				}
+			}
+		}
+	}
+	*Save the results after each imputation (running locally)
+	preserve
+	keep exposure-f_stat
+	keep if outcome != ""
+	qui replace se = sqrt(var)
+	qui replace p = 2*normal(-abs(beta/se))
+	
+	replace outcome = "QALYs per year" if outcome == "qaly"
+	replace outcome = "QALYs per year (HES only)" if outcome == "qaly_hes"
+	replace outcome = "Total healthcare costs per year" if outcome == "cost"
+	replace outcome = "Secondary healthcare costs per year" if outcome == "secondary_care_cost"
+	replace outcome = "Primary healthcare costs per year" if outcome == "primary_care_cost"
+	replace outcome = "QALY-costs per year (£10k per QALY)" if outcome == "qaly_cost_10k"
+	replace outcome = "QALY-costs per year (£20k per QALY)" if outcome == "qaly_cost_20k"
+	replace outcome = "QALY-costs per year (£30k per QALY)" if outcome == "qaly_cost_30k"
+	
+	save "$cd_tables\Results table `j'.dta", replace 
+	restore
+}
+
+*QALY (HES) and secondary care costs (both completely observed)
+use "part 3.dta", clear
+
+*Create table
+gen touse = .
+gen exposure = ""
+gen exposure_time = ""
+gen outcome = ""
+gen type = ""
+gen sex_ = ""
+gen age_ = ""
+
+gen n = .
+gen beta = .
+gen variance = .
+gen se = .
+gen double p = .
+gen double p_endog = .
+gen f_stat = .
+
+keep id_phe-qaly_hes age_group-f_stat
+
+local outcomes = "secondary_care_cost qaly_hes"
+
+local x = 1
+foreach sex in all male female {
+	foreach age in all 1 2 3 {
+		foreach time in a b c {
+			foreach grs of varlist grs_* {
+				foreach var in `outcomes' {
+					*Skip analysis for sex-specific cancers, except for their specific sex
+					if ((strpos("`grs'","ovarian") > 0 | strpos("`grs'","breast") > 0) & "`sex'" != "female") | (strpos("`grs'","prostate") > 0 & "`sex'" != "male") {
+						dis "Outcome = `var', grs = `grs', time = `time', age = `age', sex = `sex'"
+						dis "Analysis skipped"
+					} 
+					else {
+						dis "Outcome = `var', grs = `grs', time = `time', age = `age', sex = `sex'"
+						
+						*Peg the PRS to the right exposure
+						local exposure = substr("`grs'",5,4)
+						local exposure = "`time'_`exposure'"
+						
+						*touse
+						qui replace touse = 1
+						
+						if "`sex'" == "male" {
+							qui replace touse = . if sex == 0
+						}
+						if "`sex'" == "female" {
+							qui replace touse = . if sex == 1
+						}
+						
+						if "`age'" != "all" {
+							qui replace touse = . if age_group != `age'
+						}
+
+						*MR analysis
+						capture ivreg2 `var' (`exposure' = `grs') age sex pc* i.centre if touse == 1, robust endog(`exposure') 
+						
+						*Check the analysis ran - if it didn't, state this, otherwise add in data
+						if _rc {
+							qui replace exposure = "`grs'" in `x'
+							if "`time'" == "a" {
+								qui replace exposure_time = "Any" in `x'
+							}
+							else if "`time'" == "b" {
+								qui replace exposure_time = "Pre-baseline" in `x'
+							}
+							else {
+								qui replace exposure_time = "Post-baseline" in `x'
+							}
+							qui replace outcome = "`var'" in `x'
+							qui replace type = "Analysis not possible" in `x'
+							qui replace sex_ = "`sex'" in `x'
+							qui replace age_ = "`age'" in `x'
+							local x = `x' + 1
+						}
+						
+						else {
+							matrix a = e(b)
+							matrix b = e(V)
+							local beta = a[1,1]
+							local variance = b[1,1]
+							
+							local n = e(N)
+							local f_stat = e(widstat)
+							local p_endog = e(estatp)
+							
+							qui replace exposure = "`grs'" in `x'
+							if "`time'" == "a" {
+								qui replace exposure_time = "Any" in `x'
+							}
+							else if "`time'" == "b" {
+								qui replace exposure_time = "Pre-baseline" in `x'
+							}
+							else {
+								qui replace exposure_time = "Post-baseline" in `x'
+							}
+							qui replace outcome = "`var'" in `x'
+							qui replace type = "Main Analysis MR" in `x'
+							qui replace sex_ = "`sex'" in `x'
+							qui replace age_ = "`age'" in `x'
+							foreach z in beta variance n p_endog f_stat {
+								qui replace `z' = ``z'' in `x'
+							}
+							
+							local x = `x' + 1
+							
+							*Linear regression
+							qui reg `var' `exposure' age sex pc* i.centre if touse == 1
+							
+							matrix a = e(b)
+							matrix b = e(V)
+							local reg_beta = a[1,1]
+							local reg_variance = b[1,1]
+							
+							local reg_n = e(N)
+							
+							*Linear regression estimates
+							qui replace exposure = "`grs'" in `x'
+							qui replace exposure_time = "Any" in `x'
+							if "`time'" == "a" {
+								qui replace exposure_time = "Any" in `x'
+							}
+							else if "`time'" == "b" {
+								qui replace exposure_time = "Pre-baseline" in `x'
+							}
+							else {
+								qui replace exposure_time = "Post-baseline" in `x'
+							}
+							qui replace outcome = "`var'" in `x'
+							qui replace type = "Multivariable Adjusted" in `x'
+							qui replace sex_ = "`sex'" in `x'
+							qui replace age_ = "`age'" in `x'
+							foreach z in beta variance n {
+								qui replace `z' = `reg_`z'' in `x'
+							}
+							
+							local x = `x' + 1
+							
+							*Linear regression (more variables)
+							qui reg `var' `exposure' age sex pc* i.centre cov_tdi i.cov_household_income i.cov_qualifications cov_ever_smoked cov_bmi if touse == 1
+							
+							matrix a = e(b)
+							matrix b = e(V)
+							local reg_beta = a[1,1]
+							local reg_variance = b[1,1]
+							
+							local reg_n = e(N)
+							
+							*Linear regression estimates
+							qui replace exposure = "`grs'" in `x'
+							if "`time'" == "a" {
+								qui replace exposure_time = "Any" in `x'
+							}
+							else if "`time'" == "b" {
+								qui replace exposure_time = "Pre-baseline" in `x'
+							}
+							else {
+								qui replace exposure_time = "Post-baseline" in `x'
+							}
+							qui replace outcome = "`var'" in `x'
+							qui replace type = "Multivariable Adjusted - additional variables" in `x'
+							qui replace sex_ = "`sex'" in `x'
+							qui replace age_ = "`age'" in `x'
+							foreach z in beta variance n {
+								qui replace `z' = `reg_`z'' in `x'
+							}
+							
+							local x = `x' + 1
+						}
+					}						
+				}
+			}
+		}
+	}
+}
+
+keep exposure-f_stat
+keep if outcome != ""
+qui replace se = sqrt(var)
+qui replace p = 2*normal(-abs(beta/se))
+
+replace outcome = "QALYs per year (HES only)" if outcome == "qaly_hes"
+replace outcome = "Secondary healthcare costs per year" if outcome == "secondary_care_cost"
+
+rename sex_ sex
+rename age_ age
+drop variance
+
+save "$cd_tables\Results table (QALY HES & secondary care costs).dta", replace 
+
+*Combine imputations
+use "$cd_tables\Results table 0.dta", clear 
+forvalues i=1/100 {
+	append using "$cd_tables\Results table `i'.dta"
+}
+
+sort imputation exposure_time exposure outcome sex age type
+
+rename sex sex
+rename age age
+
+save "$cd_tables\Results table.dta", replace
+
+use "$cd_tables\Results table.dta", clear
+
+drop if imputation == 0
+
+encode exposure, gen(exposure2)
+encode exposure_time, gen(exposure_time2)
+encode outcome, gen(outcome2)
+encode type, gen(type2)
+encode sex, gen(sex2)
+encode age, gen(age2)
+gen beta_mean = .
+gen var_within = .
+gen var_between = .
+gen var_total = .
+gen f_stat_median = .
+gen p_endog_median = .
+
+gen touse = .
+local m = 100
+
+forvalues exposure = 1/21 {
+	dis "Exposure = `exposure'"
+	foreach exposure_time in 1 2 3 {
+		foreach outcome in 1 2 3 4 5 6 {
+			foreach type in 1 2 3 {
+				foreach sex in 1 2 3 {
+					foreach age in 1 2 3 4 {
+						qui replace touse = .
+						qui replace touse = 1 if exposure2 == `exposure' & exposure_time2 == `exposure_time' & outcome2 == `outcome' & type2 == `type' & sex2 == `sex' & age2 == `age'
+						
+						qui su beta if touse == 1
+						qui replace beta_mean = r(mean) if touse == 1
+						qui replace var_between = r(Var) if touse == 1
+						
+						qui su variance if touse == 1
+						qui replace var_within = r(mean) if touse == 1
+						
+						qui replace var_total = var_within + (1+1/`m')*var_between if touse == 1
+						
+						qui su p_endog if touse == 1, d
+						qui replace p_endog_median = r(p50) if touse == 1
+						
+						qui su f_stat if touse == 1, d
+						qui replace f_stat_median = r(p50) if touse == 1
+					}
+				}
+			}
+		}
+	}
+}
+keep exposure-age n beta_mean var_total f_stat_median p_endog_median
+duplicates drop 
+
+rename beta_mean beta
+gen se = sqrt(var_total)
+gen double p = 2*normal(-abs(beta/se))
+
+order exposure outcome exposure_time sex age type n beta se p f_stat p_endog
+sort exposure outcome exposure_time sex age type
+drop var_total
+
+save "$cd_tables\Results table (imputed).dta", replace
+
+*Add in completely observed data
+use "$cd_tables\Results table (imputed).dta", clear
+append using "$cd_tables\Results table (QALY HES & secondary care costs).dta"
+replace f_stat_median = f_stat if f_stat_median == .
+replace p_endog_median = p_endog if p_endog_median == .
+drop f_stat p_endog
+sort exposure outcome exposure_time sex age type
+
+replace exposure = subinstr(exposure,"grs_","",.)
+replace exposure = "Bladder Cancer" if exposure == "bladder"
+replace exposure = "Breast Cancer" if exposure == "breast"
+replace exposure = "Breast Cancer (ER+)" if exposure == "breast_er_pos"
+replace exposure = "Breast Cancer (ER-)" if exposure == "breast_er_neg"
+replace exposure = "Colorectal Cancer" if exposure == "colorectal"
+replace exposure = "Ovarian Cancer (Serous, High and Low Grade)" if exposure == "ovarian_s_hlg"
+replace exposure = "Ovarian Cancer (Serous, High Grade)" if exposure == "ovarian_s_hg"
+replace exposure = "Ovarian Cancer (Mucinous, Invasive)" if exposure == "ovarian_m_inv"
+replace exposure = "Ovarian Cancer (Mucinous, Low Malignant Potential)" if exposure == "ovarian_m_lmp"
+replace exposure = "Ovarian Cancer (Low Malignant Potential)" if exposure == "ovarian_lmp"
+replace exposure = "Ovarian Cancer (Mucinous, Invasive And Low Malignant Potential)" if exposure == "ovarian_m_inv_lmp"
+replace exposure = "Ovarian Cancer (Serous, Low Grade and Low Malignant Potential)" if exposure == "ovarian_s_lg_lmp"
+replace exposure = "Ovarian Cancer (Serous, Low Malignant Potential)" if exposure == "ovarian_s_lmp"
+replace exposure = "Ovarian Cancer (Clear Cell)" if exposure == "ovarian_clear_cell"
+replace exposure = "Ovarian Cancer" if exposure == "ovarian"
+replace exposure = "Lung Cancer (Squamous Cell)" if exposure == "lung_squa"
+replace exposure = "Lung Cancer (Adenocarcinoma)" if exposure == "lung_adeno"
+replace exposure = "Lung Cancer" if exposure == "lung"
+replace exposure = "Prostate Cancer" if exposure == "prostate"
+replace exposure = "Multiple Myeloma" if exposure == "multiple_myeloma"
+replace exposure = "Thyroid Cancer" if exposure == "thyroid"
+
+save "$cd_tables\Results table (complete).dta", replace 
+
+*Complete case
+use "$cd_tables\Results table.dta", clear
+
+keep if imputation == 0
+drop imputation var
+
+save "$cd_tables\Results table (complete case).dta", replace
+
+*R2 value between the PRS and their cancers
+use "part 3.dta", clear
+gen touse = .
+gen exposure = ""
+gen time = ""
+gen prs = ""
+gen age_ = ""
+gen sex_ = ""
+gen r2 = .
+
+local j = 1
+
+foreach sex in all male female {
+	foreach age in all 1 2 3 {
+		foreach time in a b c {
+			foreach grs of varlist grs_* {
+				*Skip analysis for sex-specific cancers, except for their specific sex
+				if ((strpos("`grs'","ovarian") > 0 | strpos("`grs'","breast") > 0) & "`sex'" != "female") | (strpos("`grs'","prostate") > 0 & "`sex'" != "male") {
+					dis "Outcome = `var', imputation = `j', grs = `grs', time = `time', age = `age', sex = `sex'"
+					dis "Analysis skipped"
+				} 
+				else {
+					dis "grs = `grs', time = `time', age = `age', sex = `sex'"
+					
+					*touse
+					qui replace touse = 1
+					
+					if "`sex'" == "male" {
+						qui replace touse = . if sex == 0
+					}
+					if "`sex'" == "female" {
+						qui replace touse = . if sex == 1
+					}
+					
+					if "`age'" != "all" {
+						qui replace touse = . if age_group != `age'
+					}
+
+					*Peg the PRS to the right exposure
+					local exposure = substr("`grs'",5,4)
+					local exposure = "`time'_`exposure'"
+
+					capture logistic `exposure' `grs' if touse == 1
+					if _rc {
+						qui replace exposure = proper("`exposure'") in `j'
+						qui replace time = "`time'" in `j'
+						qui replace age_ = "`age'" in `j'
+						qui replace sex_ = "`sex'" in `j'
+						qui replace prs = proper(subinstr("`grs'","grs_","",.)) in `j'
+						local j = `j'+1
+					}
+					else {
+						qui replace exposure = proper("`exposure'") in `j'
+						qui replace time = "`time'" in `j'
+						qui replace age_ = "`age'" in `j'
+						qui replace sex_ = "`sex'" in `j'
+						qui replace prs = proper(subinstr("`grs'","grs_","",.)) in `j'
+						qui replace r2 = e(r2_p) in `j'
+						local j = `j'+1
+					}					
+				}
+			}
+		}
+	}
+}
+
+keep exposure-r2
+keep if exposure != ""
+
+sort exposure prs time sex age
+order exposure prs
+
+replace time = "Any" if time == "a"
+replace time = "Pre-baseline" if time == "b"
+replace time = "Post-baseline" if time == "c"
+
+replace prs = subinstr(prs,"_"," ",.)
+replace age = "<50 years" if age == "1"
+replace age = "50 to 59 years" if age == "2"
+replace age = "60+ years" if age == "3"
+
+rename age_ age
+rename sex_ sex
+
+replace exposure = subinstr(exposure,"A_","",.)
+replace exposure = subinstr(exposure,"B_","",.)
+replace exposure = subinstr(exposure,"C_","",.)
+
+replace exposure = "Bladder" if exposure == "Blad"
+replace exposure = "Colorectal" if exposure == "Colo"
+replace exposure = "Multiple Myeloma" if exposure == "Mult"
+replace exposure = "Thyroid" if exposure == "Thyr"
+replace exposure = "Ovarian" if exposure == "Ovar"
+replace exposure = "Breast" if exposure == "Brea"
+replace exposure = "Prostate" if exposure == "Pros"
+
+save "$cd_tables\R2 value.dta", replace 
+
+}
+
+*Part Va
+*Two-sample summary MR sensitivity analyses
+{
+
+*This code regresses all SNPs against all outcomes for each trait
+*Then does all the MR sensitivity analyses (IVW, Egger, median, mode)
+*It also outputs the relevant data for R to make the sensitivity analysis plots
+
+import delim "$cd_prs_data\snp_ipd_cancer.raw", delim("") clear
+
+drop iid-phenotype
+rename fid id_ieu
+
+merge 1:1 id_ieu using linker.dta, keep(3) nogen
+order id_phe id_ieu
+
+save "snp_ipd.dta", replace
+
+use "part 3.dta", clear
+
+*SNP-outcome estimates
+foreach exposure of varlist grs* {
+	
+	local outcomes = "cost primary_care_cost qaly qaly_cost_10k qaly_cost_20k qaly_cost_30k"
+	
+	use "part 3.dta", clear
+	merge 1:1 id_phe using "snp_ipd.dta", keep(1 3) nogen
+
+	*Keep only the SNPs in the PRS
+	if "`exposure'" == "grs_bladder" {
+		keep id_phe-age_group rs1014971	rs10936599	rs1495741	rs2294008	rs401681	rs6104690	rs798766	rs8102137	rs907611	rs9642880
+	}
+	if "`exposure'" == "grs_breast" {
+		keep id_phe-age_group rs10022462	rs10054203	rs10096351	rs10623258	rs10760444	rs10885405	rs10941679	rs10978911	rs10995201	rs11117758	rs11135046	rs11205303	rs1121948	rs11249433	rs11462858	rs11571833	rs11583393	rs11624333	rs11672660	rs11684853	rs117618124	rs117737783	rs11822830	rs11903787	rs11977670	rs12207986	rs12250948	rs1230666	rs12479355	rs12487185	rs12513872	rs12519859	rs12546444	rs1268974	rs12990503	rs13066793	rs13267382	rs1498608	rs150658557	rs1685191	rs16991615	rs1707302	rs170801	rs17156577	rs17185310	rs17268829	rs17426269	rs1778523	rs1973765	rs1985742	rs2016394	rs2253012	rs2403907	rs2432539	rs2506889	rs2747652	rs2787486	rs28512361	rs2853669	rs2965183	rs2981579	rs2992756	rs332529	rs34195518	rs35383942	rs35910339	rs35961416	rs3769821	rs3821902	rs3903072	rs4081859	rs418053	rs4233486	rs4286946	rs4442975	rs4496150	rs4562056	rs4702131	rs4784227	rs4820318	rs4848599	rs4971059	rs527616	rs532436	rs56013747	rs56387622	rs56971155	rs57212245	rs58058861	rs5995875	rs5997389	rs60954078	rs6122906	rs62048402	rs62237573	rs62331150	rs62355901	rs62485509	rs630965	rs6472903	rs6562760	rs6569648	rs6596100	rs6597981	rs66572733	rs67087079	rs6725517	rs6787391	rs68056147	rs6815814	rs6882649	rs7072776	rs7149262	rs71557345	rs71559437	rs7223535	rs7258465	rs72658071	rs72725173	rs72755295	rs73949122	rs7500067	rs7626742	rs7650602	rs76956704	rs7697216	rs77528541	rs78425380	rs78440108	rs78540526	rs7904249	rs7971	rs8082452	rs9284657	rs9361840	rs9693444	rs9833888	rs9952980	rs9954058
+	}
+	if "`exposure'" == "grs_breast_er_neg" {
+		keep id_phe-age_group rs10069690	rs10096351	rs10179592	rs10885405	rs10995201	rs11076805	rs11571833	rs12129456	rs12472404	rs12990503	rs1432679	rs17828955	rs183438976	rs189268208	rs191981806	rs199504893	rs2169137	rs2731830	rs2735846	rs2747652	rs34810249	rs3769823	rs4143044	rs4528762	rs4784227	rs55872725	rs56069439	rs56309329	rs56687477	rs616402	rs62116991	rs6569648	rs6725517	rs76956704	rs7710996	rs9397437
+	}
+	if "`exposure'" == "grs_breast_er_pos" {
+		keep id_phe-age_group rs10423928	rs10828249	rs10896047	rs10941679	rs10978911	rs10995201	rs11117758	rs11133838	rs11205277	rs11249433	rs11571818	rs11624164	rs11822830	rs12110303	rs12250948	rs12481286	rs12550713	rs12703654	rs12711947	rs13267382	rs1361549	rs143048713	rs1432679	rs151090251	rs1685191	rs16857609	rs16867692	rs17035305	rs1707302	rs170801	rs17268829	rs17426269	rs17617028	rs17838698	rs1812715	rs200539634	rs2016394	rs2253012	rs2403907	rs2461201	rs2735846	rs28649231	rs2912780	rs2957449	rs2992756	rs310302	rs3217992	rs34196306	rs35054111	rs35273427	rs35353761	rs35383942	rs3769821	rs3821902	rs4076654	rs418053	rs4286946	rs4361315	rs4442975	rs4703870	rs4784227	rs4820318	rs4894562	rs490706	rs4971059	rs4980029	rs527616	rs56083805	rs5997389	rs6062356	rs60954078	rs61988429	rs62048402	rs62237573	rs62247166	rs62355902	rs62485509	rs6472903	rs6762558	rs6815814	rs688601	rs6904031	rs7017073	rs7149262	rs7153397	rs71559437	rs7223535	rs72658071	rs72755295	rs7280197	rs73169065	rs7463114	rs7500067	rs7650602	rs7697216	rs7729559	rs78029804	rs78540526	rs7862747	rs7913694	rs8105994	rs811458	rs946008	rs9952980	rs9954058
+	}
+	if "`exposure'" == "grs_colorectal" {
+		keep id_phe-age_group rs16892766	rs3184504	rs35360328	rs3802842	rs4779584	rs4939827	rs6983267	rs812481
+	}
+	if "`exposure'" == "grs_lung" {
+		keep id_phe-age_group rs11571818	rs37004	rs446975	rs501942	rs8040868
+	}
+	if "`exposure'" == "grs_lung_adeno" {
+		keep id_phe-age_group rs2736100	rs56077333
+	}
+	if "`exposure'" == "grs_lung_squa" {
+		keep id_phe-age_group rs11571818	rs12914385	rs27996	rs501942
+	}
+	if "`exposure'" == "grs_multiple_myeloma" {
+		keep id_phe-age_group rs10936600	rs139402	rs1423269	rs1948915	rs2790457	rs3132535	rs34229995	rs34562254	rs6066835	rs6599192	rs7193541	rs7577599	rs9372120
+	}
+	if "`exposure'" == "grs_ovarian" {
+		keep id_phe-age_group rs10962691	rs115478735	rs11782652	rs12952824	rs1562314	rs4449583	rs4808075	rs62276619	rs6496746	rs7084454	rs71238846	rs73375000
+	}
+	if "`exposure'" == "grs_ovarian_clear_cell" {
+		keep id_phe-age_group rs11651755
+	}
+	if "`exposure'" == "grs_ovarian_lmp" {
+		keep id_phe-age_group rs28416813	rs2857540	rs6470637	rs7705526
+	}
+	if "`exposure'" == "grs_ovarian_m_inv" {
+		keep id_phe-age_group rs10188827	rs2121245	rs688187
+	}
+	if "`exposure'" == "grs_ovarian_m_inv_lmp" {
+		keep id_phe-age_group rs112071820	rs11882871	rs2857540	rs320203	rs874898
+	}
+	if "`exposure'" == "grs_ovarian_m_lmp" {
+		keep id_phe-age_group rs11882871	rs16848785	rs2857540	rs4849174
+	}
+	if "`exposure'" == "grs_ovarian_s_hg" {
+		keep id_phe-age_group rs10962691	rs115478735	rs11782652	rs12023270	rs12594752	rs13254990	rs1400482	rs1562314	rs4808075	rs6005807	rs62276619	rs7084454	rs7217120	rs72709458	rs7405776
+	}
+	if "`exposure'" == "grs_ovarian_s_hlg" {
+		keep id_phe-age_group rs10103314	rs10962662	rs11658063	rs11782652	rs13254990	rs1562314	rs4808075	rs6005807	rs61776212	rs62276619	rs635634	rs6496746	rs7084454	rs7217120	rs72709458
+	}
+	if "`exposure'" == "grs_ovarian_s_lg_lmp" {
+		keep id_phe-age_group rs10103314	rs150293538	rs1562315	rs34466582	rs7705526	rs7902587	rs8098244	rs9870207
+	}
+	if "`exposure'" == "grs_ovarian_s_lmp" {
+		keep id_phe-age_group rs13113999	rs1400482	rs7705526
+	}
+	if "`exposure'" == "grs_prostate" {
+		keep id_phe-age_group rs10007915	rs1004030	rs1004934	rs10090154	rs10122495	rs10175792	rs10460109	rs1048169	rs1058319	rs10774740	rs10777196	rs10793821	rs10807802	rs10840603	rs10845938	rs11083450	rs11135766	rs11263763	rs112871118	rs113822101	rs1147105	rs11511618	rs11568818	rs11606284	rs11629412	rs11666569	rs11681263	rs1182_a	rs11863709	rs12139208	rs12496052	rs12570611	rs12629813	rs12665339	rs12701838	rs12769019	rs12795301	rs12821205	rs1283104	rs12956892	rs13131954	rs13174377	rs13332673	rs13388646	rs141536087	rs142449279	rs145172691	rs146564277	rs1482680	rs1634741	rs17023964	rs17120257	rs17156041	rs17464492	rs17749618	rs17819816	rs1800057	rs1811698	rs1881502	rs1935581	rs2007886	rs2136769	rs2137305	rs2191139	rs2238775	rs2242652	rs2740358	rs28485589	rs3110641	rs3131784	rs34419824	rs34925593	rs35477237	rs375314312	rs4245739	rs4713266	rs4727386	rs4924487	rs4992382	rs58235267	rs59015435	rs60079197	rs61307529	rs61735792	rs62003551	rs6470486	rs6501436	rs6557265	rs6946302	rs6982324	rs6983267	rs7094871	rs71279357	rs73307943	rs7522437	rs75358080	rs75550450	rs7572765	rs7580494	rs767127	rs76765083	rs7679542	rs76832527	rs77334358	rs78416326	rs7911198	rs7996468	rs80326387	rs8052913	rs8093601	rs817833	rs823121	rs878987	rs911846	rs9306894	rs9369290	rs9443189	rs9625483	rs9812088	rs9846396	rs9898040	rs9907478	rs9978557
+	}
+	if "`exposure'" == "grs_thyroid" {
+		keep id_phe-age_group rs11693806	rs12129938	rs1588635	rs2289261	rs2466076	rs368187	rs73227498	rs7902587
+	}
+	
+	gen imputation = .
+	gen sex_ = ""
+	gen snp = ""
+	gen effect_allele = ""
+	gen eaf = .
+	gen outcome = ""
+	gen beta = .
+	gen se = .
+	gen variance = .
+	gen p = .
+	gen n = .
+	
+	local i = 1
+	
+	forvalues imputation = 0/100 {
+		foreach outcome in `outcomes' {
+			foreach sex in all male female {
+				dis "Analysing imputation: `imputation' -- outcome: `outcome' -- sex: `sex'"
+				if "`sex'" == "all" {
+					qui regress `outcome'_`imputation' rs* age sex pc*
+				}
+				else if "`sex'" == "male" {
+					qui regress `outcome'_`imputation' rs* age pc* if sex == 1
+				}
+				else {
+					qui regress `outcome'_`imputation' rs* age pc* if sex == 0
+				}
+				
+				foreach snp of varlist rs* {
+					local snpx = substr("`snp'",1,strpos("`snp'","_")-1)
+					qui replace imputation = `imputation' in `i'
+					qui replace sex_ = "`sex'" in `i'
+					qui replace snp = "`snpx'" in `i'  
+					qui replace outcome = "`outcome'" in `i'
+					qui replace beta = _b[`snp'] in `i'
+					qui replace se = _se[`snp'] in `i'
+					qui replace n = e(N) in `i'
+					
+					if "`sex'" == "all" {
+						qui sum `snp' 
+					}
+					else if "`sex'" == "male" {
+						qui sum `snp' if sex == 1
+					}
+					else {
+						qui sum `snp' if sex == 0
+					}					 
+					qui replace eaf = r(mean)/2 in `i'
+					local effect_allele = upper(substr("`snp'",length("`snpx'")+1,length("`snp'")))
+					qui replace effect_allele = "`effect_allele'" in `i' 
+					local i = `i'+1
+				}
+			}
+		}
+	}
+	*Save
+	preserve
+	keep imputation-n
+	keep if snp != "" 
+	save "$cd_tables\SNP results (temp) - `exposure'.dta", replace
+	restore
+}
+
+*Secondary care costs & QALYs using only HES are fully observed so only need analysing once
+local outcomes = "secondary_care_cost qaly_hes"
+
+use "part 3.dta", clear
+merge 1:1 id_phe using "snp_ipd.dta", keep(1 3) nogen
+
+gen imputation = .
+gen sex_ = ""
+gen snp = ""
+gen effect_allele = ""
+gen eaf = .
+gen outcome = ""
+gen beta = .
+gen se = .
+gen variance = .
+gen p = .
+gen n = .
+
+local i = 1
+
+foreach snp of varlist rs* {
+	foreach outcome in `outcomes' {
+		foreach sex in all male female {
+			dis "Analysing outcome: `outcome' -- sex: `sex'"
+			if "`sex'" == "all" {
+				qui regress `outcome' `snp' age sex pc*
+			}
+			else if "`sex'" == "male" {
+				qui regress `outcome' `snp' age pc* if sex == 1
+			}
+			else {
+				qui regress `outcome' `snp' age pc* if sex == 0
+			}
+			
+			local snpx = substr("`snp'",1,strpos("`snp'","_")-1)
+			qui replace imputation = 0 in `i'
+			qui replace sex_ = "`sex'" in `i'
+			qui replace snp = "`snpx'" in `i'  
+			qui replace outcome = "`outcome'" in `i'
+			qui replace beta = _b[`snp'] in `i'
+			qui replace se = _se[`snp'] in `i'
+			qui replace n = e(N) in `i'
+			
+			if "`sex'" == "all" {
+				qui sum `snp' 
+			}
+			else if "`sex'" == "male" {
+				qui sum `snp' if sex == 1
+			}
+			else {
+				qui sum `snp' if sex == 0
+			}					 
+			qui replace eaf = r(mean)/2 in `i'
+			local effect_allele = upper(substr("`snp'",length("`snpx'")+1,length("`snp'")))
+			qui replace effect_allele = "`effect_allele'" in `i' 
+			local i = `i'+1
+			
+		}
+	}
+}
+
+keep imputation-n
+keep if snp != ""
+qui replace variance = se^2
+qui replace p = 2*normal(-abs(beta/se))
+
+save "$cd_tables\SNP results (temp) - observed outcomes.dta", replace
+
+*Combine all SNP-outcome results
+
+use "$cd_tables\SNP results (temp) - grs_bladder.dta", replace
+foreach exposure in grs_bladder grs_breast grs_breast_er_neg grs_breast_er_pos grs_colorectal grs_lung grs_lung_adeno grs_lung_squa grs_multiple_myeloma grs_ovarian grs_ovarian_clear_cell grs_ovarian_lmp grs_ovarian_m_inv grs_ovarian_m_inv_lmp grs_ovarian_m_lmp grs_ovarian_s_hg grs_ovarian_s_hlg grs_ovarian_s_lg_lmp grs_ovarian_s_lmp grs_prostate grs_thyroid {
+	append using "$cd_tables\SNP results (temp) - `exposure'.dta"
+}
+append using "$cd_tables\SNP results (temp) - observed outcomes.dta"
+
+rename sex_ sex
+qui replace variance = se^2
+qui replace p = 2*normal(-abs(beta/se))
+
+save "$cd_tables\Results table (SNP estimates, all imputed results).dta", replace
+
+use "$cd_tables\Results table (SNP estimates, all imputed results).dta", clear
+
+drop if imputation == 0
+
+encode outcome, gen(outcome2)
+encode snp, gen(snp2)
+encode sex, gen(sex2)
+gen beta_mean = .
+gen var_within = .
+gen var_between = .
+gen var_total = .
+
+gen touse = .
+local m = 100
+
+*Rubin's rules to combine imputed results
+forvalues outcome = 1/6 { 
+	forvalues snp = 1/437 { 
+		forvalues sex = 1/3 {
+			qui replace touse = .
+			qui replace touse = 1 if outcome2 == `outcome' & snp2 == `snp' & sex2 == `sex'
+			
+			qui su beta if touse == 1
+			qui replace beta_mean = r(mean) if touse == 1
+			qui replace var_between = r(Var) if touse == 1
+			
+			qui su variance if touse == 1
+			qui replace var_within = r(mean) if touse == 1
+			
+			qui replace var_total = var_within + (1+1/`m')*var_between if touse == 1
+		}
+	}
+}
+
+append using "$cd_tables\SNP results (temp) - observed outcomes.dta"
+replace sex = sex_ if sex == ""
+
+*Observed outcomes don't need Rubin's rules
+local outcomes = "secondary_care_cost qaly_hes"
+foreach outcome of local outcomes {
+	qui replace var_total = se^2 if outcome == "`outcome'"
+}
+
+keep snp outcome sex eaf effect_allele n beta_mean var_total 
+duplicates drop 
+
+rename beta_mean beta
+gen se = sqrt(var_total)
+drop var_total
+gen double p = 2*normal(-abs(beta/se))
+
+order outcome sex snp n beta se p 
+
+sort outcome snp sex
+
+save "$cd_tables\Results table (SNP estimates).dta", replace
+
+*Complete case
+use "$cd_tables\Results table (SNP estimates, all imputed results).dta", clear
+
+keep if imputation == 0
+drop imputation variance effect_allele eaf
+
+order outcome snp n beta se p 
+sort outcome snp
+
+save "$cd_tables\Results table (SNP estimates, complete case).dta", replace
+
+*Merge with the betas for each exposure from the GWAS
+import delim "$cd_prs_data\exposure_dat_harmonised_cancer.csv", delim(",") clear
+keep if included == 1
+
+*Some SEs are missing, replace using effect estimate & p value
+replace seexposure = "" if seexposure == "NA"
+destring seexposure, replace
+replace seexposure = abs(betaexposure/invnormal(pvalexposure/2)) if seexposure == .
+*This SNP has a p of 0 thanks to Excel, so add SE manually
+replace seexposure = 0.03446492 if snp == "rs1588635" & trait == "Thyroid_cancer"
+
+keep snp betaexposure seexposure trait
+rename beta beta_exposure
+rename se se_exposure
+
+replace trait = "bladder" if trait == "Bladder_cancer"
+replace trait = "breast" if trait == "Breast_cancer_(Combined_Oncoarray;_iCOGS;_GWAS_meta_analysis)_||_id:1126"
+replace trait = "breast_er_neg" if trait == "ER-_Breast_cancer_(Combined_Oncoarray;_iCOGS;_GWAS_meta_analysis)_||_id:1128"
+replace trait = "breast_er_pos" if trait == "ER+_Breast_cancer_(Combined_Oncoarray;_iCOGS;_GWAS_meta_analysis)_||_id:1127"
+replace trait = "colorectal" if trait == "Colorectal_cancer"
+replace trait = "lung" if trait == "Lung_cancer_||_id:966"
+replace trait = "lung_adeno" if trait == "Lung_adenocarcinoma_||_id:965"
+replace trait = "lung_squa" if trait == "Squamous_cell_lung_cancer_||_id:967"
+replace trait = "multiple_myeloma" if trait == "Multiple_myeloma"
+replace trait = "ovarian" if trait == "Ovarian_cancer_||_id:1120"
+replace trait = "ovarian_clear_cell" if trait == "Clear_cell_ovarian_cancer_||_id:1124"
+replace trait = "ovarian_lmp" if trait == "Low_malignant_potential_ovarian_cancer_||_id:1233"
+replace trait = "ovarian_m_lmp" if trait == "Low_malignant_potential_mucinous_ovarian_cancer_||_id:1232"
+replace trait = "ovarian_m_inv" if trait == "Invasive_mucinous_ovarian_cancer_||_id:1123"
+replace trait = "ovarian_m_inv_lmp" if trait == "Mucinous_ovarian_cancer:_invasive_and_low_malignant_potential_||_id:1231"
+replace trait = "ovarian_s_hg" if trait == "High_grade_serous_ovarian_cancer_||_id:1121"
+replace trait = "ovarian_s_hlg" if trait == "High_grade_and_low_grade_serous_ovarian_cancer_||_id:1228"
+replace trait = "ovarian_s_lmp" if trait == "Serous_ovarian_cancer:_low_malignant_potential_||_id:1230"
+replace trait = "ovarian_s_lg_lmp" if trait == "Serous_ovarian_cancer:_low_grade_and_low_malignant_potential_||_id:1229"
+replace trait = "prostate" if trait == "Prostate_cancer_(overall)_||_id:1174"
+replace trait = "thyroid" if trait == "Thyroid_cancer"
+drop if trait == "Cutaneous_squamous_cell_carcinoma"
+drop if trait == "Neuroblastoma_||_id:816"
+drop if trait == "Non-glioblastoma_glioma"
+
+encode trait, gen(trait2)
+
+forvalues i = 1/21 {
+	preserve
+	keep if trait2 == `i'
+	local x = trait[1]
+	drop trait trait2
+	save "exposure_dat_harmonised_`x'.dta", replace
+	restore
+}
+
+********
+*2 sample summary MR
+
+foreach exp in bladder breast breast_er_neg breast_er_pos colorectal lung lung_squa multiple_myeloma ovarian ovarian_lmp ovarian_m_inv ovarian_m_inv_lmp ovarian_m_lmp ovarian_s_hg ovarian_s_hlg ovarian_s_lg_lmp ovarian_s_lmp prostate thyroid {
+
+	use "$cd_tables\Results table (SNP estimates).dta", clear
+	merge m:1 snp using "exposure_dat_harmonised_`exp'.dta", nogen keep(3)
+
+	*Make all the exposure betas positive
+	qui replace beta = -beta if beta_exposure < 0
+	qui replace beta_exposure = -beta_exposure if beta_exposure < 0
+
+	sort outcome snp
+
+	gen out = ""
+	gen sex2 = ""
+	gen ivw = .
+	gen ivw_se = .
+	gen ivw_p = .
+	gen egger_slope = .
+	gen egger_slope_se = .
+	gen egger_slope_p = .
+	gen egger_cons = .
+	gen egger_cons_se = .
+	gen egger_cons_p = .
+	gen double heterogeneity_p = .
+	gen median = .
+	gen median_se = .
+	gen median_p = .
+	gen mode = .
+	gen mode_se = .
+	gen mode_p = .
+
+	qui levelsof outcome, local(outcome)
+	local i = 1
+
+	foreach out in `outcome' {
+		foreach sex in all male female {
+			dis "Var: `exp' -- Outcome: `out' -- sex: `sex'"
+			*MR robust takes the outcome first
+			qui replace out = "`out'" in `i'
+			qui mregger beta beta_exposure [aw=1/(se^2)] if outcome == "`out'" & sex == "`sex'", ivw heterogi
+			if !_rc {
+				qui replace heterogeneity_p = e(pval) in `i'
+			}
+			else {
+				qui mregger beta beta_exposure [aw=1/(se_^2)] if outcome == "`out'" & sex == "`sex'", ivw
+			}
+			qui replace ivw = _b[beta_exposure] in `i'
+			qui replace ivw_se = _se[beta_exposure] in `i'
+			
+			qui mregger beta beta_exposure [aw=1/(se^2)] if outcome == "`out'" & sex == "`sex'"
+			qui replace egger_slope = _b[slope] in `i'
+			qui replace egger_slope_se = _se[slope] in `i'
+			qui replace egger_cons = _b[_cons] in `i'
+			qui replace egger_cons_se = _se[_cons] in `i'
+			qui mrmedian beta se beta_exposure se_exposure if outcome == "`out'" & sex == "`sex'"
+			qui replace median = _b[beta] in `i'
+			qui replace median_se = _se[beta] in `i'
+			qui mrmodal beta se beta_exposure se_exposure if outcome == "`out'" & sex == "`sex'"
+			qui replace mode = _b[beta] in `i'
+			qui replace mode_se = _se[beta] in `i'
+			
+			qui replace sex2 = "`sex'" in `i'
+			
+			local i = `i' + 1
+		}
+	}
+
+	
+	foreach var of varlist ivw egger_slope egger_cons median mode {
+		qui replace `var'_p = 2*normal(-abs(`var'/`var'_se))
+	}
+
+	keep out-mode_p
+	keep if out != ""
+
+	rename out outcome
+
+	*Make things look better
+
+	replace outcome = "QALYs per year" if outcome == "qaly"
+	replace outcome = "QALYs per year (HES only)" if outcome == "qaly_hes"
+	replace outcome = "Total healthcare costs per year" if outcome == "cost"
+	replace outcome = "Secondary healthcare costs per year" if outcome == "secondary_care_cost"
+	replace outcome = "Primary healthcare costs per year" if outcome == "primary_care_cost"
+	replace outcome = "QALY-costs per year (£10k per QALY)" if outcome == "qaly_cost_10k"
+	replace outcome = "QALY-costs per year (£20k per QALY)" if outcome == "qaly_cost_20k"
+	replace outcome = "QALY-costs per year (£30k per QALY)" if outcome == "qaly_cost_30k"
+
+	sort outcome 
+	gen exposure = "`exp'"
+
+	save "$cd_tables\Results table (MR - `exp').dta", replace
+}
+
+*Combine
+use "$cd_tables\Results table (MR - bladder).dta", clear
+foreach var in  breast breast_er_neg breast_er_pos colorectal lung lung_squa multiple_myeloma ovarian ovarian_lmp ovarian_m_inv ovarian_m_inv_lmp ovarian_m_lmp ovarian_s_hg ovarian_s_hlg ovarian_s_lg_lmp ovarian_s_lmp prostate thyroid {
+	append using "$cd_tables\Results table (MR - `var').dta"
+}
+
+order exposure
+
+drop if strpos(exposure,"breast")>0 & sex != "female"
+drop if exposure == "prostate" & sex != "male"
+drop if sex != "all" & (exposure != "prostate" & strpos(exposure,"breast") == 0)
+drop sex
+
+save "$cd_tables\Results table (MR - all).dta", replace
+
+}
+
+*Part Vb
+*Negative control analysis
+*Prostate cancer and breast cancer analyses in the opposite sexes to the main analysis
+*Can't do IV regression (no exposures), so simple regression of the 3 main outcomes on the PRS (+ covariables) in both sexes
+*Negative control = the PRS should NOT be correlated with the outcome when the participants cannot develop the cancer (e.g. women can't get prostate cancer)
+{
+use "part 3.dta", clear
+
+*Create table
+gen touse = .
+gen exposure = ""
+gen outcome = ""
+gen type = ""
+gen sex_ = ""
+
+gen imputation = .
+gen n = .
+gen beta = .
+gen variance = .
+gen se = .
+gen double p = .
+gen double p_endog = .
+gen f_stat = .
+
+*Number of imputations
+local m = 100
+
+local outcomes = "cost qaly qaly_cost_20k"
+
+local x = 1
+forvalues j = 1/`m' {
+	dis "Imputation = `j'"
+	foreach sex in male female {
+		foreach grs of varlist grs_prostate grs_breast {
+			foreach var in `outcomes' {
+			
+				*Peg the PRS to the right exposure
+				local exposure = substr("`grs'",5,4)
+				local exposure = "`time'_`exposure'"
+				
+				*touse
+				qui replace touse = 1
+				
+				if "`sex'" == "male" {
+					qui replace touse = . if sex == 0
+				}
+				if "`sex'" == "female" {
+					qui replace touse = . if sex == 1
+				}
+				
+				*Negative control analysis
+				qui reg `var'_`j' `grs' age pc* i.centre if touse == 1
+
+				local beta = _b[`grs']
+				local variance = _se[`grs']^2
+				
+				qui replace exposure = "`grs'" in `x'
+				qui replace outcome = "`var'" in `x'
+				qui replace type = "Negative control analysis" in `x'
+				qui replace sex_ = "`sex'" in `x'
+				qui replace imputation = `j' in `x'
+				foreach z in beta variance {
+					qui replace `z' = ``z'' in `x'
+				}
+				
+				local x = `x' + 1
+			
+			}
+		}
+	}
+}	
+
+keep exposure-f_stat
+keep if outcome != ""
+qui replace se = sqrt(var)
+qui replace p = 2*normal(-abs(beta/se))
+
+replace outcome = "QALYs per year" if outcome == "qaly"
+replace outcome = "QALYs per year (HES only)" if outcome == "qaly_hes"
+replace outcome = "Total healthcare costs per year" if outcome == "cost"
+replace outcome = "Secondary healthcare costs per year" if outcome == "secondary_care_cost"
+replace outcome = "Primary healthcare costs per year" if outcome == "primary_care_cost"
+replace outcome = "QALY-costs per year (£10k per QALY)" if outcome == "qaly_cost_10k"
+replace outcome = "QALY-costs per year (£20k per QALY)" if outcome == "qaly_cost_20k"
+replace outcome = "QALY-costs per year (£30k per QALY)" if outcome == "qaly_cost_30k"	
+
+*Rubin's rules
+
+encode exposure, gen(exposure2)
+encode outcome, gen(outcome2)
+encode sex, gen(sex2)
+
+gen beta_mean = .
+gen var_within = .
+gen var_between = .
+gen var_total = .
+
+gen touse = .
+local m = 100
+
+forvalues exposure = 1/2 {
+	dis "Exposure = `exposure'"
+	foreach outcome in 1 2 3 {
+		foreach sex in 1 2 {
+
+			qui replace touse = .
+			qui replace touse = 1 if exposure2 == `exposure' & outcome2 == `outcome' & sex2 == `sex'
+			
+			qui su beta if touse == 1
+			qui replace beta_mean = r(mean) if touse == 1
+			qui replace var_between = r(Var) if touse == 1
+			
+			qui su variance if touse == 1
+			qui replace var_within = r(mean) if touse == 1
+			
+			qui replace var_total = var_within + (1+1/`m')*var_between if touse == 1
+		}
+	}
+}
+keep exposure-sex_ beta_mean var_total
+duplicates drop 
+
+rename beta_mean beta
+gen se = sqrt(var_total)
+gen double p = 2*normal(-abs(beta/se))
+
+order exposure outcome sex beta se p
+sort exposure outcome sex
+drop var_total
+
+qui replace beta = 100*beta if outcome == "QALYs per year"
+qui replace se = 100*se if outcome == "QALYs per year"
+
+save "Negative control analysis.dta", replace	
+	
+}
+
+*Part VI
+*Policy analyses
+{
+*1 - Cost-effectiveness of an intervention for BMI (laparoscopic bariatric surgery)
+{
+
+use "UK data service\2017\stata\stata13\hse17i_eul_v1.dta", clear
+keep if Age16g5 >= 7 & Age16g5 <= 12
+
+gen age_cat2 = 0 if Age16g5 == 7
+replace age_cat2 = 1 if Age16g5 < 9 & age_cat2 == .
+replace age_cat2 = 2 if Age16g5 < 10 & age_cat2 == .
+replace age_cat2 = 3 if Age16g5 < 11 & age_cat2 == .
+replace age_cat2 = 4 if Age16g5 < 12 & age_cat2 == .
+replace age_cat2 = 5 if age_cat2 == .
+
+
+keep age_cat BMI Weight Height
+rename BMI bmi
+
+drop if bmi < 0
+label drop _all
+
+*Create a variable to represent how many people each individual represents
+*Note: age categories 0 and 1 should be combined later
+qui gen double n_total = 7677215 if age_cat < 2
+qui replace n_total = 4129245 if age_cat == 2
+qui replace n_total = 3686614 if age_cat == 3
+qui replace n_total = 3169875 if age_cat == 4
+qui replace n_total = 3079548 if age_cat == 5
+
+gen n = .
+qui count if age_cat < 2
+qui replace n = n_total/r(N) if age_cat < 2
+
+forvalues i = 2/5 {
+	qui count if age_cat == `i'
+	qui replace n = n_total/r(N) if age_cat == `i'
+}
+drop if bmi <= 35
+
+rename Height height
+rename Weight weight
+
+drop n_total
+
+save "sensitivity_analysis_1_raw.dta", replace
+
+*Need to format the results from main analysis to use them with the applied analyses
+use "$cd_tables\Results table (sensitivity 2a).dta", clear
+gen age_cat2 = 0
+replace age_cat2 = 1 if sensitivity == "<50 years"
+replace age_cat2 = 2 if sensitivity == "50-54 years"
+replace age_cat2 = 3 if sensitivity == "55-59 years"
+replace age_cat2 = 4 if sensitivity == "60-64 years"
+replace age_cat2 = 5 if sensitivity == "65+ years"
+
+drop if bmi_cat == "All"
+keep outcome-se_all age_cat2
+drop n_all
+
+rename beta_all beta_normal
+rename se_all se_normal
+
+foreach x in overweight obese overweight_or_obese {
+	gen beta_`x' = beta_normal
+	gen se_`x' = se_normal
+}
+
+foreach x in beta se {
+	qui replace `x'_normal = . if bmi_cat != "Normal"
+	qui replace `x'_overweight = . if bmi_cat != "Overweight"
+	qui replace `x'_obese = . if bmi_cat != "Obese"
+	qui replace `x'_overweight_or_obese = . if bmi_cat != "Overweight Or Obese"
+}
+
+foreach var of varlist beta_normal-se_overweight_or_obese {
+	bysort outcome type sensitivity: egen x = mean(`var')
+	qui replace `var' = x if bmi_cat == "Normal"
+	drop x
+}
+sort outcome type bmi_cat age_cat2
+
+keep if bmi_cat == "Normal"
+drop bmi_cat sensitivity
+
+order age_cat2
+
+*Costs and QALYs only
+drop if strpos(outcome,"HES") > 0 | strpos(outcome,"D4") > 0
+
+encode outcome, gen(x)
+drop outcome
+rename x outcome
+
+encode type, gen(y)
+drop type
+rename y type
+order outcome type
+
+save "Secondary analysis - effect estimates.dta", replace
+
+*****
+
+*Need to simulate the effect of the treatment, including error
+*Also need to account for error in the BMI effect estimates
+*Run through 10,000 times, letting the values of the intervention effect and effect estimates come from normal distributions
+
+*Grab estimates & SEs from part I
+use "Secondary analysis - effect estimates.dta", clear
+forvalues type = 1/2 {
+	forvalues outcome = 1/7 {
+		foreach bmi in normal overweight obese {
+			forvalues age = 1/5 {
+				qui su beta_`bmi' if outcome == `outcome' & type == `type' & age_cat2 == `age'
+				local beta_`outcome'_`type'_`bmi'_`age' = r(mean)
+				qui su se_`bmi' if outcome == `outcome' & type == `type' & age_cat2 == `age'
+				local se_`outcome'_`type'_`bmi'_`age' = r(mean)
+			}
+		}
+	}
+}
+
+clear
+set seed 123
+set obs 140000
+gen outcome = .
+gen type = .
+gen estimate00 = .
+gen estimate15 = .
+gen estimate35 = .
+
+forvalues sim = 1/10000 {
+dis "Sim = `sim'"
+qui{
+preserve
+	
+	*Simulate intervention
+	use "sensitivity_analysis_1_raw.dta", clear
+	
+	*Need to randomly assign each person an age from within their age band
+	*Use a uniform distribution for simplicity
+	gen age = 40+runiform(0,4.99999) if age_cat == 0
+	replace age = 45+runiform(0,4.99999) if age_cat == 1
+	replace age = 50+runiform(0,4.99999) if age_cat == 2
+	replace age = 55+runiform(0,4.99999) if age_cat == 3
+	replace age = 60+runiform(0,4.99999) if age_cat == 4
+	replace age = 65+runiform(0,4.99999) if age_cat == 5	
+	
+	*The intervention has a random normal effect, mean -25%, SE 1.5%
+	local intervention_effect = rnormal(0.75,0.015)
+
+	gen weight_int = weight * `intervention_effect'
+	gen bmi_int = weight_int/(height/100)^2
+
+	gen bmi_change = bmi_int - bmi
+
+	gen bmi_change_normal = bmi_int - 25 if bmi_int < 25
+	replace bmi_change_normal = 0 if bmi_int >= 25
+
+	gen bmi_change_overweight = bmi_int - 30 if bmi_int < 30
+	replace bmi_change_overweight = 25 - bmi if bmi_int < 25
+	replace bmi_change_overweight = -5 if bmi_int < 25 & bmi > 30
+	replace bmi_change_overweight = 0 if bmi_int >= 30
+
+	gen bmi_change_obese = bmi_change
+	replace bmi_change_obese = 30 - bmi if bmi_int < 30 & bmi >= 30
+	
+	*Multiply each of the BMI changes by the number of people each individual represents
+	foreach var of varlist bmi_change* {
+		qui replace `var' = `var'*n
+	}
+	
+	keep bmi_change* age
+	
+	*For each of the 20 years of follow-up (-10 and +10 years from baseline):
+	*Count the number of participants in each age group, and the average BMI change
+	*OR get the total BMI change for each age group for each year
+	*Then sum across years
+
+	*So the final pre-merge dataset will be a list of age groups and the total BMI change in each, multiplied by the number of people each individual represents
+
+	gen age_new = .
+	gen age_cat = .
+	forvalues i = -10/9 {
+		replace age_new = age + `i'
+
+		local k = `i'+11
+		
+		replace age_cat = 1 if age_new < 50
+		replace age_cat = 2 if age_new < 55 & age_new >= 50
+		replace age_cat = 3 if age_new < 60 & age_new >= 55
+		replace age_cat = 4 if age_new < 65 & age_new >= 60
+		replace age_cat = 5 if age_new >=65
+		
+		forvalues j = 1/5 {
+			qui count if age_cat == `j'
+			local n_`k'_`j' = r(N)
+			
+			foreach var of varlist bmi_change* {
+				qui su `var' if age_cat == `j'
+				local `var'_`k'_`j' = r(sum)
+			}
+		}
+	}
+
+	clear
+	set obs 105
+	gen year = .
+	gen age_cat = .
+	gen n = .
+	gen bmi_change = .
+	gen bmi_change_normal = .
+	gen bmi_change_overweight = .
+	gen bmi_change_obese = .
+
+	local x = 1
+
+	forvalues i = 1/20 {
+		forvalues j = 1/5 {
+			qui replace year = `i'-11 in `x'
+			qui replace age_cat = `j' in `x'
+			foreach var of varlist n-bmi_change_obese {
+				qui replace `var' = ``var'_`i'_`j'' in `x'
+			}
+			local x = `x' + 1
+		}
+	}
+
+	forvalues i = 1/5 {
+		local x = `i'+100
+		qui replace age_cat = `i' in `x'
+		foreach var of varlist n-bmi_change_obese {
+			qui su `var' if age_cat == `i'
+			qui replace `var' = r(sum) in `x'
+		}
+	}
+
+	qui replace year = 10 if year == .
+	rename age_cat age_cat2
+	
+	expand 14
+	sort year age_cat2
+	egen outcome = fill(1 2 3 4 5 6 7 1 2 3 4 5 6 7)
+	egen type = fill(1 1 1 1 1 1 1 2 2 2 2 2 2 2 1 1 1 1 1 1 1 2 2 2 2 2 2 2)
+	
+	gen beta_normal = .
+	gen beta_overweight = .
+	gen beta_obese = .
+	
+	*The estimates from the main analysis are simulated here:
+	forvalues type = 1/2 {
+		forvalues outcome = 1/7 {
+			foreach bmi in normal overweight obese {
+				forvalues age = 1/5 {
+					local x = rnormal(`beta_`outcome'_`type'_`bmi'_`age'',`se_`outcome'_`type'_`bmi'_`age'') 
+					replace beta_`bmi' = `x' if outcome == `outcome' & type == `type' & age_cat2 == `age'
+				}
+			}
+		}
+	}
+
+	order outcome type age_cat* year bmi_change*
+	sort type outcome age_cat2 year
+	
+	gen estimate00 = (bmi_change_normal*beta_normal + bmi_change_overweight*beta_overweight + bmi_change_obese*beta_obese)
+	gen estimate15 = estimate00*0.985^(year+10)
+	gen estimate35 = estimate00*0.965^(year+10)
+
+	drop bmi_change-beta_obese
+
+	foreach var of varlist estimate* {
+		bysort outcome type year: egen `var'_sum = total(`var')
+	}
+
+	keep outcome type year *_sum
+	duplicates drop
+
+	*Year = 10 (sum of all years) is now useless, since it only works for discount of 0%
+	foreach var of varlist estimate00 estimate15 estimate35 {
+		replace `var' = . if year == 10
+		bysort outcome type: egen `var'_sum = total(`var') 
+		replace `var' = `var'_sum if year == 10
+		drop `var'_sum
+	}
+
+	keep if year == 10
+	
+	forvalues type = 1/2 {
+		forvalues outcome = 1/7 {
+			foreach estimate in 00 15 35 {
+				qui su estimate`estimate' if outcome == `outcome' & type == `type'
+				local `outcome'_`type'_`estimate' = r(mean)
+			}
+		}
+	}
+	
+restore
+
+local obs = (`sim'-1)*14+1
+forvalues type = 1/2 {
+	forvalues outcome = 1/7 {
+		foreach estimate in 00 15 35 {
+			replace estimate`estimate' = ``outcome'_`type'_`estimate'' in `obs'
+		}
+	replace outcome = `outcome' in `obs'
+	replace type = `type' in `obs'
+	local obs = `obs'+1
+	}
+}
+}
+}
+
+save "sim results from applied analysis 1.dta", replace
+
+use "sim results from applied analysis 1.dta", clear
+
+foreach estimate in 00 15 35 {
+	gen median_`estimate' = .
+	gen l95_`estimate' = .
+	gen u95_`estimate' = .
+}
+
+forvalues type = 1/2 {
+	forvalues outcome = 1/7 {
+		foreach estimate in 00 15 35 {
+			qui su estimate`estimate' if outcome == `outcome' & type == `type', d
+			qui replace median_`estimate' = r(p50) if outcome == `outcome' & type == `type'
+			qui su estimate`estimate' if outcome == `outcome' & type == `type' & estimate`estimate' <= r(p50), d
+			qui replace l95_`estimate' = r(p5) if outcome == `outcome' & type == `type'
+			qui su estimate`estimate' if outcome == `outcome' & type == `type' & estimate`estimate' >= r(p50), d
+			qui replace u95_`estimate' = r(p95) if outcome == `outcome' & type == `type'			
+		}
+	}
+}
+
+keep type outcome median_* l95_* u95_*
+duplicates drop
+
+rename outcome outcome2
+gen outcome = ""
+
+replace outcome = "Primary healthcare costs per year" if outcome2 == 1
+replace outcome = "QALY-costs per year (£10k per QALY)" if outcome2 == 2
+replace outcome = "QALY-costs per year (£20k per QALY)" if outcome2 == 3
+replace outcome = "QALY-costs per year (£30k per QALY)" if outcome2 == 4
+replace outcome = "QALYs per year" if outcome2 == 5
+replace outcome = "Secondary healthcare costs per year" if outcome2 == 6
+replace outcome = "Total healthcare costs per year" if outcome2 == 7
+
+drop outcome2
+
+rename type type2
+gen type = "Main Analysis MR" if type2 == 1
+replace type = "Multivariable Adjusted" if type2 == 2
+
+drop type2
+
+order outcome type
+sort outcome type
+
+save "Applied analysis 1 - results.dta", replace 
+
+}
+
+*2 - Estimation of a Population change in BMI (applied example)
+{
+*Need to know weight and height in 2017
+*Note: DHSC calorie model assumes that 0.042kg is lost for every 1 fewer Calorie consumed
+
+*2017
+use "UK data service\2017\stata\stata13\hse17i_eul_v1.dta", clear
+keep if Age16g5 >= 7 & Age16g5 <= 12
+
+gen age_cat = 1 if Age16g5 < 9
+replace age_cat = 2 if Age16g5 < 10 & age_cat == .
+replace age_cat = 3 if Age16g5 < 11 & age_cat == .
+replace age_cat = 4 if Age16g5 < 12 & age_cat == .
+replace age_cat = 5 if age_cat == .
+
+keep age_cat Height Weight Sex
+rename Height height
+rename Weight weight
+rename Sex sex
+
+drop if height <0
+drop if weight <0
+
+gen weight2 = weight - 0.042*14 if age_cat != 5 & sex == 1
+replace weight2 = weight - 0.042*13 if age_cat == 5 & sex == 1
+replace weight2 = weight - 0.042*11 if age_cat != 5 & sex == 2
+replace weight2 = weight - 0.042*10 if age_cat == 5 & sex == 2
+
+gen bmi_1 = weight/(height/100)^2
+gen bmi_2 = weight2/(height/100)^2
+
+label drop _all
+
+*Create a variable to represent how many people each individual represents
+*Note: age categories 0 and 1 should be combined later
+qui gen double n_total = 7677215 if age_cat < 2
+qui replace n_total = 4129245 if age_cat == 2
+qui replace n_total = 3686614 if age_cat == 3
+qui replace n_total = 3169875 if age_cat == 4
+qui replace n_total = 3079548 if age_cat == 5
+
+gen n = .
+qui count if age_cat < 2
+qui replace n = n_total/r(N) if age_cat < 2
+
+forvalues i = 2/5 {
+	qui count if age_cat == `i'
+	qui replace n = n_total/r(N) if age_cat == `i'
+}
+
+drop n_total
+
+gen bmi_change_normal = bmi_2-bmi_1
+replace bmi_change_normal = 25 - bmi_1 if bmi_2 > 25
+replace bmi_change_normal = 0 if bmi_1 > 25
+
+gen bmi_change_overweight = bmi_2-bmi_1
+replace bmi_change_overweight = 30 - bmi_1 if bmi_2 > 30
+replace bmi_change_overweight = bmi_2 - 25 if bmi_1 < 25
+replace bmi_change_overweight = 0 if bmi_1 > 30 | (bmi_1 < 25 & bmi_2 < 25)
+
+gen bmi_change_obese = bmi_2-bmi_1
+replace bmi_change_obese = bmi_2 - 30 if bmi_1 < 30
+replace bmi_change_obese = 0 if bmi_1 < 30 & bmi_2 < 30
+
+foreach var of varlist bmi_change* {
+	qui replace `var' = `var'*n
+}
+
+keep age_cat bmi_change*
+
+sort age_cat
+
+foreach var of varlist bmi_change* {
+	bysort age_cat: egen `var'_total = total(`var')
+}
+
+drop bmi_change_normal-bmi_change_obese
+duplicates drop
+
+rename bmi_change_normal bmi_change_normal
+rename bmi_change_overweight bmi_change_overweight
+rename bmi_change_obese bmi_change_obese
+
+rename age_cat age_cat2
+
+gen age_cat = "40-49 years" if age_cat2 == 1
+replace age_cat = "50-54 years" if age_cat2 == 2
+replace age_cat = "55-59 years" if age_cat2 == 3
+replace age_cat = "60-64 years" if age_cat2 == 4
+replace age_cat = "65-69 years" if age_cat2 == 5
+
+order age_cat
+
+save "Secondary analysis 2 - for table.dta", replace 
+
+expand 14
+sort age_cat2
+egen outcome = fill(1 2 3 4 5 6 7 1 2 3 4 5 6 7)
+egen type = fill(1 1 1 1 1 1 1 2 2 2 2 2 2 2 1 1 1 1 1 1 1 2 2 2 2 2 2 2)
+
+gen beta_normal = .
+gen beta_overweight = .
+gen beta_obese = .
+
+save "Secondary analysis 2 - raw.dta", replace
+
+****
+
+*Simulation
+
+*Grab estimates & SEs from part I
+use "Secondary analysis - effect estimates.dta", clear
+forvalues type = 1/2 {
+	forvalues outcome = 1/7 {
+		foreach bmi in normal overweight obese {
+			forvalues age = 1/5 {
+				qui su beta_`bmi' if outcome == `outcome' & type == `type' & age_cat2 == `age'
+				local beta_`outcome'_`type'_`bmi'_`age' = r(mean)
+				qui su se_`bmi' if outcome == `outcome' & type == `type' & age_cat2 == `age'
+				local se_`outcome'_`type'_`bmi'_`age' = r(mean)
+			}
+		}
+	}
+}
+
+clear
+
+set seed 123
+set obs 140000
+gen outcome = .
+gen type = .
+gen estimate = .
+
+forvalues sim = 1/10000 {
+if mod(`sim',200) == 0{
+	dis "Sim = `sim'"
+}
+qui{
+preserve
+
+	use "Secondary analysis 2 - raw.dta", clear
+	
+	*The estimates from part I are simulated here:
+	forvalues type = 1/2 {
+		forvalues outcome = 1/7 {
+			foreach bmi in normal overweight obese {
+				forvalues age = 1/5 {
+					local x = rnormal(`beta_`outcome'_`type'_`bmi'_`age'',`se_`outcome'_`type'_`bmi'_`age'') 
+					replace beta_`bmi' = `x' if outcome == `outcome' & type == `type' & age_cat2 == `age'
+				}
+			}
+		}
+	}
+	
+	order outcome type age_cat* bmi_change*
+	sort type outcome age_cat2
+	
+	gen estimate = bmi_change_normal*beta_normal + bmi_change_overweight*beta_overweight + bmi_change_obese*beta_obese
+
+	drop bmi_change_normal-beta_obese
+
+	bysort outcome type: egen estimate_sum = total(estimate)
+
+	keep outcome type estimate_sum
+	duplicates drop
+
+	forvalues type = 1/2 {
+		forvalues outcome = 1/7 {
+			qui su estimate if outcome == `outcome' & type == `type'
+			local `outcome'_`type' = r(mean)
+		}
+	}
+restore
+
+local obs = (`sim'-1)*14+1
+forvalues type = 1/2 {
+	forvalues outcome = 1/7 {
+		replace estimate = ``outcome'_`type'' in `obs'
+		replace outcome = `outcome' in `obs'
+		replace type = `type' in `obs'
+		local obs = `obs'+1
+	}
+}
+}
+}
+
+save "sim results from applied analysis 2.dta", replace
+
+use "sim results from applied analysis 2.dta", clear
+
+gen median = .
+gen l95 = .
+gen u95 = .
+
+forvalues type = 1/2 {
+	forvalues outcome = 1/7 {
+		qui su estimate if outcome == `outcome' & type == `type', d
+		qui replace median = r(p50) if outcome == `outcome' & type == `type'
+		qui su estimate if outcome == `outcome' & type == `type' & estimate <= r(p50), d
+		qui replace l95 = r(p5) if outcome == `outcome' & type == `type'
+		qui su estimate if outcome == `outcome' & type == `type' & estimate >= r(p50), d
+		qui replace u95 = r(p95) if outcome == `outcome' & type == `type'			
+	}
+}
+
+keep type outcome median l95 u95
+duplicates drop
+
+rename outcome outcome2
+gen outcome = ""
+
+replace outcome = "Primary healthcare costs per year" if outcome2 == 1
+replace outcome = "QALY-costs per year (£10k per QALY)" if outcome2 == 2
+replace outcome = "QALY-costs per year (£20k per QALY)" if outcome2 == 3
+replace outcome = "QALY-costs per year (£30k per QALY)" if outcome2 == 4
+replace outcome = "QALYs per year" if outcome2 == 5
+replace outcome = "Secondary healthcare costs per year" if outcome2 == 6
+replace outcome = "Total healthcare costs per year" if outcome2 == 7
+
+drop outcome2
+
+rename type type2
+gen type = "Main Analysis MR" if type2 == 1
+replace type = "Multivariable Adjusted" if type2 == 2
+
+drop type2
+
+order outcome type
+sort outcome type
+
+save "Applied analysis 2 - results.dta", replace
+
+}
+
+*3 - Estimation of a Population change in BMI (1993 to 2017)
+{
+*Need to know the proportion of people at different BMI levels in 1993 versus 2017
+*1993
+use "UK data service\1993\stata8\3316.dta", clear
+keep if bmiok == 1
+keep age bmi
+keep if age > 39 & age < 70
+
+gen age_cat = 1 if age < 50
+replace age_cat = 2 if age < 55 & age_cat == .
+replace age_cat = 3 if age < 60 & age_cat == .
+replace age_cat = 4 if age < 65 & age_cat == .
+replace age_cat = 5 if age_cat == .
+
+label drop _all
+drop age
+
+save "age_bmi_1993.dta", replace
+
+*2017
+use "UK data service\2017\stata\stata13\hse17i_eul_v1.dta", clear
+keep if Age16g5 >= 7 & Age16g5 <= 12
+
+gen age_cat = 1 if Age16g5 < 9
+replace age_cat = 2 if Age16g5 < 10 & age_cat == .
+replace age_cat = 3 if Age16g5 < 11 & age_cat == .
+replace age_cat = 4 if Age16g5 < 12 & age_cat == .
+replace age_cat = 5 if age_cat == .
+
+keep age_cat BMI
+rename BMI bmi
+
+drop if bmi < 0
+label drop _all
+
+save "age_bmi_2017.dta", replace
+
+*Combine
+use "age_bmi_1993.dta", clear
+gen year = 1993
+append using "age_bmi_2017.dta"
+replace year = 2017 if year == .
+
+xtile bmi_1 = bmi if year == 1993, nq(10)
+xtile bmi_2 = bmi if year == 2017, nq(10)
+
+qui replace bmi_1 = bmi_2 if bmi_1 == .
+drop bmi_2
+
+gen decile = .
+gen bmi_mean_1993 = .
+gen bmi_mean_2017 = .
+
+gen age_cat2 = .
+
+local i = 1
+
+forvalues age = 1/5 {
+	forvalues decile = 1/10 {
+		qui replace decile = `decile' in `i'
+		foreach j in 1993 2017 {
+			qui su bmi if bmi_1 == `decile' & year == `j' & age_cat == `age'
+			qui replace bmi_mean_`j' = r(mean) in `i'
+			qui replace age_cat2 = `age' in `i'
+		}
+		local i = `i' + 1
+	}
+}
+
+gen bmi_change_normal = bmi_mean_2017-bmi_mean_1993
+replace bmi_change_normal = 25 - bmi_mean_1993 if bmi_mean_2017 > 25
+replace bmi_change_normal = 0 if bmi_mean_1993 > 25
+
+gen bmi_change_overweight = bmi_mean_2017-bmi_mean_1993
+replace bmi_change_overweight = 30 - bmi_mean_1993 if bmi_mean_2017 > 30
+replace bmi_change_overweight = bmi_mean_2017 - 25 if bmi_mean_1993 < 25
+replace bmi_change_overweight = 0 if bmi_mean_1993 > 30 | (bmi_mean_1993 < 25 & bmi_mean_2017 < 25)
+
+gen bmi_change_obese = bmi_mean_2017-bmi_mean_1993
+replace bmi_change_obese = bmi_mean_2017 - 30 if bmi_mean_1993 < 30
+replace bmi_change_obese = 0 if bmi_mean_1993 < 30 & bmi_mean_2017 < 30
+
+keep if decile != .
+keep decile - bmi_change_obese
+
+sort age_cat2 decile
+
+gen age_cat = "40-49 years" if age_cat2 == 1
+replace age_cat = "50-54 years" if age_cat2 == 2
+replace age_cat = "55-59 years" if age_cat2 == 3
+replace age_cat = "60-64 years" if age_cat2 == 4
+replace age_cat = "65-69 years" if age_cat2 == 5
+
+order age_cat
+
+save "Secondary analysis 3 - for table.dta", replace 
+
+expand 14
+sort decile age_cat2
+egen outcome = fill(1 2 3 4 5 6 7 1 2 3 4 5 6 7)
+egen type = fill(1 1 1 1 1 1 1 2 2 2 2 2 2 2 1 1 1 1 1 1 1 2 2 2 2 2 2 2)
+
+gen beta_normal = .
+gen beta_overweight = .
+gen beta_obese = .
+
+drop bmi_mean*
+
+qui gen n_total = 7677215/10 if age_cat2 == 1
+qui replace n_total = 4129245/10 if age_cat2 == 2
+qui replace n_total = 3686614/10 if age_cat2 == 3
+qui replace n_total = 3169875/10 if age_cat2 == 4
+qui replace n_total = 3079548/10 if age_cat2 == 5
+
+save "Secondary analysis 3.dta", replace
+
+****
+
+*Simulation
+
+*Grab estimates & SEs from part I
+use "Secondary analysis - effect estimates.dta", clear
+forvalues type = 1/2 {
+	forvalues outcome = 1/7 {
+		foreach bmi in normal overweight obese {
+			forvalues age = 1/5 {
+				qui su beta_`bmi' if outcome == `outcome' & type == `type' & age_cat2 == `age'
+				local beta_`outcome'_`type'_`bmi'_`age' = r(mean)
+				qui su se_`bmi' if outcome == `outcome' & type == `type' & age_cat2 == `age'
+				local se_`outcome'_`type'_`bmi'_`age' = r(mean)
+			}
+		}
+	}
+}
+
+clear
+
+set seed 123
+set obs 140000
+gen outcome = .
+gen type = .
+gen estimate = .
+
+forvalues sim = 1/10000 {
+dis "Sim = `sim'"
+qui{
+preserve
+
+	use "Secondary analysis 3.dta", clear
+	
+	*The estimates from part I are simulated here:
+	forvalues type = 1/2 {
+		forvalues outcome = 1/7 {
+			foreach bmi in normal overweight obese {
+				forvalues age = 1/5 {
+					local x = rnormal(`beta_`outcome'_`type'_`bmi'_`age'',`se_`outcome'_`type'_`bmi'_`age'') 
+					replace beta_`bmi' = `x' if outcome == `outcome' & type == `type' & age_cat2 == `age'
+				}
+			}
+		}
+	}
+	
+	order outcome type age_cat* decile bmi_change*
+	sort type outcome age_cat2 decile
+	
+	gen estimate = n_total*(bmi_change_normal*beta_normal + bmi_change_overweight*beta_overweight + bmi_change_obese*beta_obese)
+
+	drop bmi_change_normal-beta_obese
+
+	bysort outcome type: egen estimate_sum = total(estimate)
+
+	keep outcome type estimate_sum
+	duplicates drop
+
+	forvalues type = 1/2 {
+		forvalues outcome = 1/7 {
+			qui su estimate if outcome == `outcome' & type == `type'
+			local `outcome'_`type' = r(mean)
+		}
+	}
+restore
+
+local obs = (`sim'-1)*14+1
+forvalues type = 1/2 {
+	forvalues outcome = 1/7 {
+		replace estimate = ``outcome'_`type'' in `obs'
+		replace outcome = `outcome' in `obs'
+		replace type = `type' in `obs'
+		local obs = `obs'+1
+	}
+}
+}
+}
+
+save "sim results from applied analysis 3.dta", replace
+
+use "sim results from applied analysis 3.dta", clear
+
+gen median = .
+gen l95 = .
+gen u95 = .
+
+forvalues type = 1/2 {
+	forvalues outcome = 1/7 {
+		qui su estimate if outcome == `outcome' & type == `type', d
+		qui replace median = r(p50) if outcome == `outcome' & type == `type'
+		qui su estimate if outcome == `outcome' & type == `type' & estimate <= r(p50), d
+		qui replace l95 = r(p5) if outcome == `outcome' & type == `type'
+		qui su estimate if outcome == `outcome' & type == `type' & estimate >= r(p50), d
+		qui replace u95 = r(p95) if outcome == `outcome' & type == `type'			
+	}
+}
+
+keep type outcome median l95 u95
+duplicates drop
+
+rename outcome outcome2
+gen outcome = ""
+
+replace outcome = "Primary healthcare costs per year" if outcome2 == 1
+replace outcome = "QALY-costs per year (£10k per QALY)" if outcome2 == 2
+replace outcome = "QALY-costs per year (£20k per QALY)" if outcome2 == 3
+replace outcome = "QALY-costs per year (£30k per QALY)" if outcome2 == 4
+replace outcome = "QALYs per year" if outcome2 == 5
+replace outcome = "Secondary healthcare costs per year" if outcome2 == 6
+replace outcome = "Total healthcare costs per year" if outcome2 == 7
+
+drop outcome2
+
+rename type type2
+gen type = "Main Analysis MR" if type2 == 1
+replace type = "Multivariable Adjusted" if type2 == 2
+
+drop type2
+
+order outcome type
+sort outcome type
+
+save "Applied analysis 3 - results.dta", replace
+
+}
+
+*4 - Estimation of the cost of being overweight/obese (in 2017)
+{
+
+*England and Wales version
+use "UK data service\2017\stata\stata13\hse17i_eul_v1.dta", clear
+keep if Age16g5 >= 7 & Age16g5 <= 12
+
+gen age_cat2 = 0 if Age16g5 == 7
+replace age_cat2 = 1 if Age16g5 < 9 & age_cat2 == .
+replace age_cat2 = 2 if Age16g5 < 10 & age_cat2 == .
+replace age_cat2 = 3 if Age16g5 < 11 & age_cat2 == .
+replace age_cat2 = 4 if Age16g5 < 12 & age_cat2 == .
+replace age_cat2 = 5 if age_cat2 == .
+
+keep age_cat BMI Weight Height
+rename BMI bmi
+
+drop if bmi < 0
+label drop _all
+
+*Create a variable to represent how many people each individual represents
+*Note: age categories 0 and 1 should be combined later
+qui gen double n_total = 7677215 if age_cat < 2
+qui replace n_total = 4129245 if age_cat == 2
+qui replace n_total = 3686614 if age_cat == 3
+qui replace n_total = 3169875 if age_cat == 4
+qui replace n_total = 3079548 if age_cat == 5
+
+gen n = .
+qui count if age_cat < 2
+qui replace n = n_total/r(N) if age_cat < 2
+
+forvalues i = 2/5 {
+	qui count if age_cat == `i'
+	qui replace n = n_total/r(N) if age_cat == `i'
+}
+
+rename Height height
+rename Weight weight
+
+drop n_total
+
+gen bmi_change_normal = 0
+
+gen bmi_change_overweight = bmi - 25 if bmi > 25 & bmi < 30
+replace bmi_change_overweight = 5 if bmi >= 30
+replace bmi_change_overweight = 0 if bmi <= 25
+
+gen bmi_change_obese = bmi - 30 if bmi > 30
+replace bmi_change_obese = 0 if bmi <=30
+
+*Multiply each of the BMI changes by the number of people each individual represents
+foreach var of varlist bmi_change* {
+	qui replace `var' = `var'*n
+}
+
+keep age_cat bmi_change*
+sort age_cat
+
+replace age_cat = 1 if age_cat == 0
+
+foreach var of varlist bmi_change* {
+	bysort age_cat: egen `var'_total = total(`var')
+}
+
+drop bmi_change_normal-bmi_change_obese
+duplicates drop
+
+rename bmi_change_normal bmi_change_normal
+rename bmi_change_overweight bmi_change_overweight
+rename bmi_change_obese bmi_change_obese
+
+gen age_cat = "40-49 years" if age_cat2 == 1
+replace age_cat = "50-54 years" if age_cat2 == 2
+replace age_cat = "55-59 years" if age_cat2 == 3
+replace age_cat = "60-64 years" if age_cat2 == 4
+replace age_cat = "65-69 years" if age_cat2 == 5
+
+order age_cat
+
+save "Secondary analysis 4 - for table.dta", replace 
+
+expand 14
+sort age_cat2
+egen outcome = fill(1 2 3 4 5 6 7 1 2 3 4 5 6 7)
+egen type = fill(1 1 1 1 1 1 1 2 2 2 2 2 2 2 1 1 1 1 1 1 1 2 2 2 2 2 2 2)
+
+gen beta_normal = .
+gen beta_overweight = .
+gen beta_obese = .
+
+save "Secondary analysis 4 - raw.dta", replace
+
+****
+
+*Simulation
+
+*Grab estimates & SEs from part I
+use "Secondary analysis - effect estimates.dta", clear
+forvalues type = 1/2 {
+	forvalues outcome = 1/7 {
+		foreach bmi in normal overweight obese {
+			forvalues age = 1/5 {
+				qui su beta_`bmi' if outcome == `outcome' & type == `type' & age_cat2 == `age'
+				local beta_`outcome'_`type'_`bmi'_`age' = r(mean)
+				qui su se_`bmi' if outcome == `outcome' & type == `type' & age_cat2 == `age'
+				local se_`outcome'_`type'_`bmi'_`age' = r(mean)
+			}
+		}
+	}
+}
+
+clear
+
+set seed 123
+set obs 140000
+gen outcome = .
+gen type = .
+gen estimate = .
+
+forvalues sim = 1/10000 {
+if mod(`sim',200) == 0{
+	dis "Sim = `sim'"
+}
+qui{
+preserve
+
+	use "Secondary analysis 4 - raw.dta", clear
+	
+	*The estimates from part I are simulated here:
+	forvalues type = 1/2 {
+		forvalues outcome = 1/7 {
+			foreach bmi in normal overweight obese {
+				forvalues age = 1/5 {
+					local x = rnormal(`beta_`outcome'_`type'_`bmi'_`age'',`se_`outcome'_`type'_`bmi'_`age'') 
+					replace beta_`bmi' = `x' if outcome == `outcome' & type == `type' & age_cat2 == `age'
+				}
+			}
+		}
+	}
+	
+	order outcome type age_cat* bmi_change*
+	sort type outcome age_cat2
+	
+	gen estimate = bmi_change_normal*beta_normal + bmi_change_overweight*beta_overweight + bmi_change_obese*beta_obese
+
+	drop bmi_change_normal-beta_obese
+
+	bysort outcome type: egen estimate_sum = total(estimate)
+
+	keep outcome type estimate_sum
+	duplicates drop
+
+	forvalues type = 1/2 {
+		forvalues outcome = 1/7 {
+			qui su estimate if outcome == `outcome' & type == `type'
+			local `outcome'_`type' = r(mean)
+		}
+	}
+restore
+
+local obs = (`sim'-1)*14+1
+forvalues type = 1/2 {
+	forvalues outcome = 1/7 {
+		replace estimate = ``outcome'_`type'' in `obs'
+		replace outcome = `outcome' in `obs'
+		replace type = `type' in `obs'
+		local obs = `obs'+1
+	}
+}
+}
+}
+
+save "sim results from applied analysis 4.dta", replace
+
+use "sim results from applied analysis 4.dta", clear
+
+gen median = .
+gen l95 = .
+gen u95 = .
+
+forvalues type = 1/2 {
+	forvalues outcome = 1/7 {
+		qui su estimate if outcome == `outcome' & type == `type', d
+		qui replace median = r(p50) if outcome == `outcome' & type == `type'
+		qui su estimate if outcome == `outcome' & type == `type' & estimate <= r(p50), d
+		qui replace l95 = r(p5) if outcome == `outcome' & type == `type'
+		qui su estimate if outcome == `outcome' & type == `type' & estimate >= r(p50), d
+		qui replace u95 = r(p95) if outcome == `outcome' & type == `type'			
+	}
+}
+
+keep type outcome median l95 u95
+duplicates drop
+
+rename outcome outcome2
+gen outcome = ""
+
+replace outcome = "Primary healthcare costs per year" if outcome2 == 1
+replace outcome = "QALY-costs per year (£10k per QALY)" if outcome2 == 2
+replace outcome = "QALY-costs per year (£20k per QALY)" if outcome2 == 3
+replace outcome = "QALY-costs per year (£30k per QALY)" if outcome2 == 4
+replace outcome = "QALYs per year" if outcome2 == 5
+replace outcome = "Secondary healthcare costs per year" if outcome2 == 6
+replace outcome = "Total healthcare costs per year" if outcome2 == 7
+
+drop outcome2
+
+rename type type2
+gen type = "Main Analysis MR" if type2 == 1
+replace type = "Multivariable Adjusted" if type2 == 2
+
+drop type2
+
+order outcome type
+sort outcome type
+
+save "Applied analysis 4 - results.dta", replace
+	
+}
+
+}
+
+}
+
+*Part VII
+*Tables
+{
+
+*Table 1 - Summary
+{
+use "part 3.dta", clear
+
+gen Variable = ""
+gen All = ""
+gen N_All = ""
+gen Men = ""
+gen N_Men = ""
+gen Women = ""
+gen N_Women = ""
+order Variable-N_Women, first
+
+qui replace Variable = "N" in 1
+qui replace Variable = "Age at recruitment, years [Mean (SD)]" in 2
+qui replace Variable = "Participants with primary care data [N (%)]" in 3
+qui replace Variable = "Average QALYs per year [Median (IQR)]*" in 4
+qui replace Variable = "Average QALYs per year, HES only [Median (IQR)]" in 5
+qui replace Variable = "Average Total Healthcare costs per year [Median (IQR)]*" in 6
+qui replace Variable = "Average Primary Healthcare costs per year [Median (IQR)]*" in 7
+qui replace Variable = "Average Secondary Healthcare costs per year [Median (IQR)]" in 8
+
+gen primary_care = 0 if primary_care_cost_0 == .
+replace primary_care = 1 if primary_care == .
+
+gen p25 = .
+gen p50 = . 
+gen p75 = .
+
+local i = 1
+
+*Number of participants
+{
+qui sum sex
+local x = r(N)
+local x: dis %9.0fc `x'
+local x = strtrim("`x'")
+local x1 = r(N)*r(mean)
+local x1: dis %9.0fc `x1'
+local x1 = strtrim("`x1'")
+local x2 = r(N)*(1-r(mean))
+local x2: dis %9.0fc `x2'
+local x2 = strtrim("`x2'")
+qui replace All = "`x'" in `i'
+qui replace Men = "`x1'" in `i'
+qui replace Women = "`x2'" in `i'
+local i = `i' + 1
+}
+
+*Age
+foreach var of varlist age {
+	qui sum `var'
+	local mean = r(mean)
+	local mean: dis %9.1f `mean'
+	local mean = strtrim("`mean'")
+	local N = r(N)
+	local N: dis %9.0fc `N'
+	local N = strtrim("`N'")
+	local sd = r(sd)
+	local sd: dis %9.2f `sd'
+	local sd = strtrim("`sd'")
+	local x = "`mean' (`sd')"
+	qui replace All = "`x'" in `i'
+	qui replace N_All = "`N'" in `i'
+	
+	qui sum `var' if sex == 1
+	local mean = r(mean)
+	local mean: dis %9.1f `mean'
+	local mean = strtrim("`mean'")
+	local N = r(N)
+	local N: dis %9.0fc `N'
+	local N = strtrim("`N'")
+	local sd = r(sd)
+	local sd: dis %9.2f `sd'
+	local sd = strtrim("`sd'")
+	local x = "`mean' (`sd')"
+	qui replace Men = "`x'" in `i'
+	qui replace N_Men = "`N'" in `i'
+
+	qui sum `var' if sex == 0
+	local mean = r(mean)
+	local mean: dis %9.1f `mean'
+	local mean = strtrim("`mean'")
+	local N = r(N)
+	local N: dis %9.0fc `N'
+	local N = strtrim("`N'")
+	local sd = r(sd)
+	local sd: dis %9.2f `sd'
+	local sd = strtrim("`sd'")
+	local x = "`mean' (`sd')"
+	qui replace Women = "`x'" in `i'
+	qui replace N_Women = "`N'" in `i'
+	
+	local i = `i' + 1
+}
+
+*Primary care
+foreach var of varlist primary_care {
+		
+	qui sum `var'
+	local N = r(mean)*r(N)
+	local N: dis %9.0fc `N'
+	local N = strtrim("`N'")
+	local percent = r(mean)*100
+	local percent: dis %9.2f `percent'
+	local percent = strtrim("`percent'")
+	local x = "`N' (`percent')"
+	qui replace All = "`x'" in `i'
+	
+	local N2 = r(N)
+	local N2: dis %9.0fc `N2'
+	local N2 = strtrim("`N2'")
+	qui replace N_All = "`N2'" in `i'
+	
+	qui sum `var' if sex == 1
+	local N = r(mean)*r(N)
+	local N: dis %9.0fc `N'
+	local N = strtrim("`N'")
+	local percent = r(mean)*100
+	local percent: dis %9.2f `percent'
+	local percent = strtrim("`percent'")
+	local x = "`N' (`percent')"
+	qui replace Men = "`x'" in `i'
+	
+	local N2 = r(N)
+	local N2: dis %9.0fc `N2'
+	local N2 = strtrim("`N2'")
+	qui replace N_Men = "`N2'" in `i'
+
+	qui sum `var' if sex == 0
+	local N = r(mean)*r(N)
+	local N: dis %9.0fc `N'
+	local N = strtrim("`N'")
+	local percent = r(mean)*100
+	local percent: dis %9.2f `percent'
+	local percent = strtrim("`percent'")
+	local x = "`N' (`percent')"
+	qui replace Women = "`x'" in `i'
+	
+	local N2 = r(N)
+	local N2: dis %9.0fc `N2'
+	local N2 = strtrim("`N2'")
+	qui replace N_Women = "`N2'" in `i'
+		
+	local i = `i'+1
+}
+
+*QALYs
+foreach var in qaly {
+	*All
+	forvalues j = 1/100 {
+		qui su `var'_`j', d
+		qui replace p25 = r(p25) in `j'
+		qui replace p50 = r(p50) in `j'
+		qui replace p75 = r(p75) in `j'
+	}
+		
+	qui sum p50, d
+	local median = r(p50)
+	local median: dis %9.2f `median'
+	local median = strtrim("`median'")
+	qui sum p25, d
+	local p25 = r(p50)
+	local p25: dis %9.2f `p25'
+	local p25 = strtrim("`p25'")
+	qui sum p75, d
+	local p75 = r(p50)
+	local p75: dis %9.2f `p75'
+	local p75 = strtrim("`p75'")
+	local x = "`median' (`p25' to `p75')"
+	qui replace All = "`x'" in `i'
+	
+	*Men
+	forvalues j = 1/100 {
+		qui su `var'_`j' if sex == 1, d
+		qui replace p25 = r(p25) in `j'
+		qui replace p50 = r(p50) in `j'
+		qui replace p75 = r(p75) in `j'
+	}	
+	qui sum p50, d
+	local median = r(p50)
+	local median: dis %9.2f `median'
+	local median = strtrim("`median'")
+	qui sum p25, d
+	local p25 = r(p50)
+	local p25: dis %9.2f `p25'
+	local p25 = strtrim("`p25'")
+	qui sum p75, d
+	local p75 = r(p50)
+	local p75: dis %9.2f `p75'
+	local p75 = strtrim("`p75'")
+	local x = "`median' (`p25' to `p75')"
+	qui replace Men = "`x'" in `i'
+	
+	*Women
+	forvalues j = 1/100 {
+		qui su `var'_`j' if sex == 0, d
+		qui replace p25 = r(p25) in `j'
+		qui replace p50 = r(p50) in `j'
+		qui replace p75 = r(p75) in `j'
+	}	
+	qui sum p50, d
+	local median = r(p50)
+	local median: dis %9.2f `median'
+	local median = strtrim("`median'")
+	qui sum p25, d
+	local p25 = r(p50)
+	local p25: dis %9.2f `p25'
+	local p25 = strtrim("`p25'")
+	qui sum p75, d
+	local p75 = r(p50)
+	local p75: dis %9.2f `p75'
+	local p75 = strtrim("`p75'")
+	local x = "`median' (`p25' to `p75')"
+	qui replace Women = "`x'" in `i'
+	
+	local i = `i' + 1
+}
+
+*HES QALYs
+foreach var of varlist qaly_hes {
+	*All
+	
+	qui sum `var', d
+	local median = r(p50)
+	local median: dis %9.2f `median'
+	local median = strtrim("`median'")
+	local p25 = r(p25)
+	local p25: dis %9.2f `p25'
+	local p25 = strtrim("`p25'")
+	local p75 = r(p75)
+	local p75: dis %9.2f `p75'
+	local p75 = strtrim("`p75'")
+	local x = "`median' (`p25' to `p75')"
+	qui replace All = "`x'" in `i'
+	
+	*Men
+	qui su `var' if sex == 1, d
+	local median = r(p50)
+	local median: dis %9.2f `median'
+	local median = strtrim("`median'")
+	local p25 = r(p25)
+	local p25: dis %9.2f `p25'
+	local p25 = strtrim("`p25'")
+	local p75 = r(p75)
+	local p75: dis %9.2f `p75'
+	local p75 = strtrim("`p75'")
+	local x = "`median' (`p25' to `p75')"
+	qui replace Men = "`x'" in `i'
+	
+	*Women
+	qui su `var' if sex == 0, d
+	local median = r(p50)
+	local median: dis %9.2f `median'
+	local median = strtrim("`median'")
+	local p25 = r(p25)
+	local p25: dis %9.2f `p25'
+	local p25 = strtrim("`p25'")
+	qui sum p75, d
+	local p75 = r(p75)
+	local p75: dis %9.2f `p75'
+	local p75 = strtrim("`p75'")
+	local x = "`median' (`p25' to `p75')"
+	qui replace Women = "`x'" in `i'
+	
+	local i = `i' + 1
+}
+
+*Costs
+foreach var in cost primary_care_cost {
+	*All
+	forvalues j = 1/100 {
+		qui su `var'_`j', d
+		qui replace p25 = r(p25) in `j'
+		qui replace p50 = r(p50) in `j'
+		qui replace p75 = r(p75) in `j'
+	}
+	qui sum p50, d
+	local median = r(p50)
+	local median: dis %9.0fc `median'
+	local median = strtrim("`median'")
+	qui sum p25, d
+	local p25 = r(p50)
+	local p25: dis %9.0fc `p25'
+	local p25 = strtrim("`p25'")
+	qui sum p75, d
+	local p75 = r(p50)
+	local p75: dis %9.0fc `p75'
+	local p75 = strtrim("`p75'")
+	local x = "£`median' (£`p25' to £`p75')"
+	qui replace All = "`x'" in `i'
+	
+	*Men
+	forvalues j = 1/100 {
+		qui su `var'_`j' if sex == 1, d
+		qui replace p25 = r(p25) in `j'
+		qui replace p50 = r(p50) in `j'
+		qui replace p75 = r(p75) in `j'
+	}
+	qui sum p50, d
+	local median = r(p50)
+	local median: dis %9.0fc `median'
+	local median = strtrim("`median'")
+	qui sum p25, d
+	local p25 = r(p50)
+	local p25: dis %9.0fc `p25'
+	local p25 = strtrim("`p25'")
+	qui sum p75, d
+	local p75 = r(p50)
+	local p75: dis %9.0fc `p75'
+	local p75 = strtrim("`p75'")
+	local x = "£`median' (£`p25' to £`p75')"
+	qui replace Men = "`x'" in `i'
+	
+	*Women
+	forvalues j = 1/100 {
+		qui su `var'_`j' if sex == 0, d
+		qui replace p25 = r(p25) in `j'
+		qui replace p50 = r(p50) in `j'
+		qui replace p75 = r(p75) in `j'
+	}
+	qui sum p50, d
+	local median = r(p50)
+	local median: dis %9.0fc `median'
+	local median = strtrim("`median'")
+	qui sum p25, d
+	local p25 = r(p50)
+	local p25: dis %9.0fc `p25'
+	local p25 = strtrim("`p25'")
+	qui sum p75, d
+	local p75 = r(p50)
+	local p75: dis %9.0fc `p75'
+	local p75 = strtrim("`p75'")
+	local x = "£`median' (£`p25' to £`p75')"
+	qui replace Women = "`x'" in `i'
+	
+	local i = `i' + 1
+}
+
+*Secondary care costs
+foreach var of varlist secondary_care_cost {
+	qui sum `var', d
+	local median = r(p50)
+	local median: dis %9.0fc `median'
+	local median = strtrim("`median'")
+	local p25 = r(p25)
+	local p25: dis %9.0fc `p25'
+	local p25 = strtrim("`p25'")
+	local p75 = r(p75)
+	local p75: dis %9.0fc `p75'
+	local p75 = strtrim("`p75'")
+	local x = "£`median' (£`p25' to £`p75')"
+	qui replace All = "`x'" in `i'
+	
+	qui sum `var' if sex == 1, d
+	local median = r(p50)
+	local median: dis %9.0fc `median'
+	local median = strtrim("`median'")
+	local p25 = r(p25)
+	local p25: dis %9.0fc `p25'
+	local p25 = strtrim("`p25'")
+	local p75 = r(p75)
+	local p75: dis %9.0fc `p75'
+	local p75 = strtrim("`p75'")
+	local x = "£`median' (£`p25' to £`p75')"
+	qui replace Men = "`x'" in `i'
+
+	qui sum `var' if sex == 0, d
+	local median = r(p50)
+	local median: dis %9.0fc `median'
+	local median = strtrim("`median'")
+	local p25 = r(p25)
+	local p25: dis %9.0fc `p25'
+	local p25 = strtrim("`p25'")
+	local p75 = r(p75)
+	local p75: dis %9.0fc `p75'
+	local p75 = strtrim("`p75'")
+	local x = "£`median' (£`p25' to £`p75')"
+	qui replace Women = "`x'" in `i'
+	
+	local i = `i' + 1
+}
+
+keep Var-N_Women
+drop N*
+
+drop if Variable == ""
+
+save "$cd_tables\Table 1.dta", replace
+}
+
+*Table 2 - Main analysis results
+{
+use "$cd_tables\Results table (complete).dta", clear
+
+rename exposure Exposure
+rename outcome Outcome
+rename type Type
+rename beta Beta
+rename se SE
+rename p P
+rename p_endog P_Endog
+rename f_stat F_Stat
+rename n N
+
+sort Outcome Type
+
+drop F_Stat
+
+gen l95 = Beta-1.96*SE, a(Beta)
+gen u95 = Beta+1.96*SE, a(l95)
+drop SE
+
+*Remove all sensitivity analyses
+keep if exposure_time == "Any"
+keep if age == "all"
+drop if strpos(Exposure,"(")>0
+keep if sex == "all" | (sex == "female" & (Exposure == "Breast Cancer" | Exposure == "Ovarian Cancer")) | (sex == "male" & Exposure == "Prostate Cancer")
+drop if Type == "Multivariable Adjusted - additional variables"
+drop exposure_time sex age 
+keep if Outcome == "QALY-costs per year (£20k per QALY)" | Outcome == "QALYs per year" | Outcome == "Total healthcare costs per year"
+
+gen beta1 = ""
+gen p1 = .
+gen beta2 = ""
+gen p2 = .
+
+replace Outcome = "XX" if Outcome == "QALY-costs per year (£20k per QALY)"
+sort Exposure Outcome Type
+replace Outcome = "QALY-costs per year (£20k per QALY)" if Outcome == "XX"
+
+local max = c(N)/2
+forvalues i = 1/`max' {
+	forvalues j = 1/2 {
+		local j`j' = (`i'-1)*2+`j'
+		local beta`j' = Beta[`j`j'']
+		local l95`j' = l95[`j`j'']
+		local u95`j' = u95[`j`j'']
+		if strpos(Outcome[`j`j''],"costs") > 0 {
+			local beta`j': di %7.0fc `beta`j''
+			local beta`j' = "£`beta`j''"
+			local beta`j' = subinstr("`beta`j''","£-","-£",.)
+			local beta`j' = subinstr("`beta`j''","  "," ",.)
+			local beta`j' = subinstr("`beta`j''","  "," ",.)
+			local beta`j' = subinstr("`beta`j''","£ ","£",.)
+			local l95`j': di %7.0fc `l95`j''
+			local l95`j' = "£`l95`j''"
+			local l95`j' = subinstr("`l95`j''","£-","-£",.)
+			local l95`j' = subinstr("`l95`j''","  "," ",.)
+			local l95`j' = subinstr("`l95`j''","  "," ",.)
+			local l95`j' = subinstr("`l95`j''","£ ","£",.)
+			local u95`j': di %7.0fc `u95`j''
+			local u95`j' = "£`u95`j''"
+			local u95`j' = subinstr("`u95`j''","£-","-£",.)
+			local u95`j' = subinstr("`u95`j''","  "," ",.)
+			local u95`j' = subinstr("`u95`j''","  "," ",.)
+			local u95`j' = subinstr("`u95`j''","£ ","£",.)
+		}
+		else {
+			local beta`j' = `beta`j''*100
+			local beta`j': di %3.2f `beta`j''
+			local beta`j' = "`beta`j''%"
+			local l95`j' = `l95`j''*100
+			local l95`j': di %3.2f `l95`j''
+			local l95`j' = "`l95`j''%"
+			local u95`j' = `u95`j''*100
+			local u95`j': di %3.2f `u95`j''
+			local u95`j' = "`u95`j''%"
+		}
+		local beta`j' = "`beta`j'' (`l95`j'' to `u95`j'')"
+		qui replace beta`j' = "`beta`j''" in `j1'
+		qui replace p`j' = P[`j`j''] in `j1'
+		
+		qui replace beta`j' = "" if p`j' == .
+	}
+}
+
+keep if beta2 != ""
+drop Type
+drop Beta-P
+order P_Endog, last
+
+drop N p1 p2
+
+save "$cd_tables\Table 2.dta", replace
+
+}
+
+*Supplementary table 1 - SNPs
+{
+
+import delim "$cd_prs_data\exposure_dat_harmonised_cancer.csv", delim(",") clear
+drop x1 x exposure pval_ori mr_keepexposure clumped priority clump_num samplesize-ncontrol
+drop if included == 0
+drop included
+capture drop unitsexposure_dat
+
+sort trait snp
+replace trait = proper(trait)
+replace trait = subinstr(trait,"_"," ",.)
+replace data_source = "MR Base" if data_source == "mrbase"
+
+rename snp SNP
+rename idexposure GWAS_ID
+rename effect_alleleex Effect_Allele
+rename other_alleleex Other_Allele
+rename eafex EAF
+rename beta Beta
+rename see SE
+rename pval P
+rename units Units
+rename data_source GWAS_Source
+rename trait Exposure
+
+order Exposure GWAS_ID GWAS_Source SNP Effect_Allele Other_Allele EAF Beta SE P Units 
+
+*Remove NAs
+foreach var of varlist EAF SE Units proxy_r2-eaforiginal {
+	qui replace `var' = "" if `var' == "NA"
+}
+
+foreach var of varlist EAF SE proxy_r2 eaforiginal {
+	destring `var', replace
+}
+
+replace Exposure = "Breast Cancer" if Exposure == "Breast Cancer (Combined Oncoarray; Icogs; Gwas Meta Analysis) || Id:1126"
+replace Exposure = "Breast Cancer (ER+)" if Exposure == "Er+ Breast Cancer (Combined Oncoarray; Icogs; Gwas Meta Analysis) || Id:1127"
+replace Exposure = "Breast Cancer (ER-)" if Exposure == "Er- Breast Cancer (Combined Oncoarray; Icogs; Gwas Meta Analysis) || Id:1128"
+replace Exposure = "Ovarian Cancer (Serous, High and Low Grade)" if Exposure == "High Grade And Low Grade Serous Ovarian Cancer || Id:1228"
+replace Exposure = "Ovarian Cancer (Serous, High Grade)" if Exposure == "High Grade Serous Ovarian Cancer || Id:1121"
+replace Exposure = "Ovarian Cancer (Mucinous, Invasive)" if Exposure == "Invasive Mucinous Ovarian Cancer || Id:1123"
+replace Exposure = "Ovarian Cancer (Mucinous, Low Malignant Potential)" if Exposure == "Low Malignant Potential Mucinous Ovarian Cancer || Id:1232"
+replace Exposure = "Ovarian Cancer (Low Malignant Potential)" if Exposure == "Low Malignant Potential Ovarian Cancer || Id:1233"
+replace Exposure = "Ovarian Cancer (Mucinous, Invasive And Low Malignant Potential)" if Exposure == "Mucinous Ovarian Cancer: Invasive And Low Malignant Potential || Id:1231"
+replace Exposure = "Ovarian Cancer (Serous, Low Grade and Low Malignant Potential)" if Exposure == "Serous Ovarian Cancer: Low Grade And Low Malignant Potential || Id:1229"
+replace Exposure = "Ovarian Cancer (Serous, Low Malignant Potential)" if Exposure == "Serous Ovarian Cancer: Low Malignant Potential || Id:1230"
+replace Exposure = "Ovarian Cancer (Clear Cell)" if Exposure == "Clear Cell Ovarian Cancer || Id:1124"
+replace Exposure = "Ovarian Cancer" if Exposure == "Ovarian Cancer || Id:1120"
+replace Exposure = "Lung Cancer (Squamous Cell)" if Exposure == "Squamous Cell Lung Cancer || Id:967"
+replace Exposure = "Lung Cancer (Adenocarcinoma)" if Exposure == "Lung Adenocarcinoma || Id:965"
+replace Exposure = "Lung Cancer" if Exposure == "Lung Cancer || Id:966"
+replace Exposure = "Prostate Cancer" if Exposure == "Prostate Cancer (Overall) || Id:1174"
+
+drop if Exposure == "Neuroblastoma || Id:816" | Exposure == "Non-Glioblastoma Glioma" | Exposure == "Cutaneous Squamous Cell Carcinoma"
+
+tostring proxy, replace
+replace proxy = "" if proxy == "0"
+replace proxy = "Yes" if proxy == "1"
+rename proxy Proxy
+rename proxy_r2 Proxy_R2
+rename snporiginal Original_SNP
+rename effect_alleleoriginal Original_Effect_Allele
+rename other_alleleoriginal Original_Other_Allele
+rename eaforiginal Original_EAF
+
+replace Original_Effect_Allele = "T" if Original_Effect_Allele == "TRUE"
+
+destring EAF, replace
+format EAF %3.2f
+format Beta %4.3f
+
+sort Exposure SNP
+
+drop P
+gen double P = 2*normal(-abs(Beta/SE)),a(SE)
+
+order GWAS_ID GWAS_Source, last
+
+save "$cd_tables\Supplementary Table 1.dta", replace
+
+}
+
+*Supplementary table 2 - QALY codes
+{
+*Not created in Stata
+}
+
+*Supplementary table 3 - Summary MR results
+{
+use "$cd_tables\Results table (MR - all).dta", clear
+rename outcome Outcome
+rename exposure Exposure
+order heterogeneity_p, a(Outcome)
+
+replace Exposure = "Bladder Cancer" if Exposure == "bladder"
+replace Exposure = "Breast Cancer" if Exposure == "breast"
+replace Exposure = "Breast Cancer (ER+)" if Exposure == "breast_er_pos"
+replace Exposure = "Breast Cancer (ER-)" if Exposure == "breast_er_neg"
+replace Exposure = "Colorectal Cancer" if Exposure == "colorectal"
+replace Exposure = "Ovarian Cancer (Serous, High and Low Grade)" if Exposure == "ovarian_s_hlg"
+replace Exposure = "Ovarian Cancer (Serous, High Grade)" if Exposure == "ovarian_s_hg"
+replace Exposure = "Ovarian Cancer (Mucinous, Invasive)" if Exposure == "ovarian_m_inv"
+replace Exposure = "Ovarian Cancer (Mucinous, Low Malignant Potential)" if Exposure == "ovarian_m_lmp"
+replace Exposure = "Ovarian Cancer (Low Malignant Potential)" if Exposure == "ovarian_lmp"
+replace Exposure = "Ovarian Cancer (Mucinous, Invasive And Low Malignant Potential)" if Exposure == "ovarian_m_inv_lmp"
+replace Exposure = "Ovarian Cancer (Serous, Low Grade and Low Malignant Potential)" if Exposure == "ovarian_s_lg_lmp"
+replace Exposure = "Ovarian Cancer (Serous, Low Malignant Potential)" if Exposure == "ovarian_s_lmp"
+replace Exposure = "Ovarian Cancer" if Exposure == "ovarian"
+replace Exposure = "Lung Cancer (Squamous Cell)" if Exposure == "lung_squa"
+replace Exposure = "Lung Cancer (Adenocarcinoma)" if Exposure == "Lung adeno"
+replace Exposure = "Lung Cancer" if Exposure == "lung"
+replace Exposure = "Prostate Cancer" if Exposure == "prostate"
+replace Exposure = "Multiple Myeloma" if Exposure == "multiple_myeloma"
+replace Exposure = "Thyroid Cancer" if Exposure == "thyroid"
+sort Exposure Outcome
+
+encode Outcome , gen(sort)
+replace sort = -10 if sort == 5 //QALYs
+replace sort = -9 if sort == 6 //QALYS (HES)
+replace sort = -8 if sort == 8 //Total costs
+replace sort = -7 if sort == 1 //Primary costs
+replace sort = -6 if sort == 7 //Secondary costs
+replace sort = 20 if sort == 2 //QALY-costs (£10k)
+replace sort = 21 if sort == 3 //QALY-costs (£20k)
+replace sort = 22 if sort == 4 //QALY-costs (£30k)
+sort Exposure sort
+drop sort
+
+save "$cd_tables\Supplementary Table 3", replace
+}
+
+*Supplementary table 4 - All analyses
+{
+use "$cd_tables\Results table (complete).dta", clear
+
+rename exposure Exposure
+rename outcome Outcome
+rename type Type
+
+encode Outcome , gen(sort)
+replace sort = -10 if sort == 5 //QALYs
+replace sort = -9 if sort == 6 //QALYS (HES)
+replace sort = -8 if sort == 8 //Total costs
+replace sort = -7 if sort == 1 //Primary costs
+replace sort = -6 if sort == 7 //Secondary costs
+replace sort = 20 if sort == 2 //QALY-costs (£10k)
+replace sort = 21 if sort == 3 //QALY-costs (£20k)
+replace sort = 22 if sort == 4 //QALY-costs (£30k)
+
+gen sort2 = 1 if age == "all"
+replace sort2 = 2 if age == "1"
+replace sort2 = 3 if age == "2"
+replace sort2 = 4 if age == "3"
+
+gen sort3 = 1 if exposure_time == "Any"
+replace sort3 = 2 if exposure_time == "Pre-baseline"
+replace sort3 = 3 if exposure_time == "Post-baseline"
+
+gsort Exposure sort sex sort3 sort2 Type  
+drop sort*
+
+replace sex = "All" if sex == "all"
+replace sex = proper(sex)
+
+replace age = "All" if age == "all"
+replace age = "<50 years" if age == "1"
+replace age = "50 to 59 years" if age == "2"
+replace age = "60+ years" if age == "3"
+
+replace exposure_time = "All" if exposure_time == "Any"
+
+order Type, a(Outcome)
+
+gen PRS = Exposure, b(Exposure)
+replace Exposure = "Breast Cancer" if strpos(PRS,"Breast Cancer")>0
+replace Exposure = "Lung Cancer" if strpos(PRS,"Lung Cancer")>0
+replace Exposure = "Ovarian Cancer" if strpos(PRS,"Ovarian Cancer")>0
+
+save "$cd_tables\Supplementary Table 4", replace
+}
+
+*Supplementary table 13 - Change in BMI from population intervention (HFSS)
+{
+use "Applied analysis 2 - results.dta", clear 
+
+*Make the costs in millions
+foreach var of varlist median l95 u95 {
+	qui replace `var' = `var'/1000000 if strpos(outcome,"cost") > 0
+}
+
+*Sort
+encode outcome , gen(sort)
+replace sort = -10 if sort == 5
+replace sort = 20 if sort == 2
+replace sort = 21 if sort == 3
+replace sort = 22 if sort == 4
+sort sort type
+drop sort
+
+replace outcome = outcome + " (£ millions)" if strpos(outcome, "cost") > 0
+
+rename outcome Outcome
+rename type Type
+
+save "$cd_tables\Supplementary Table 13", replace
+}
+
+*Supplementary table 14 - Change in BMI from population intervention (HFSS) (per person)
+{
+use "Applied analysis 2 - results.dta", clear 
+
+foreach var of varlist median l95 u95 {
+	qui replace `var' = `var'/21742497
+}
+
+*Sort
+encode outcome , gen(sort)
+replace sort = -10 if sort == 5
+replace sort = 20 if sort == 2
+replace sort = 21 if sort == 3
+replace sort = 22 if sort == 4
+sort sort type
+drop sort
+
+rename outcome Outcome
+rename type Type
+
+save "$cd_tables\Supplementary Table 14", replace
+
+}
+
+*Supplementary table 15 - Age-specific changes in BMI by BMI decile
+{
+use "Secondary analysis 3 - for table.dta", clear
+
+rename age_cat Age_category
+rename decile BMI_Decile
+drop age_cat2
+
+save "$cd_tables\Supplementary Table 15", replace
+
+}
+
+*Supplementary table 16 - Changes in BMI between 1993 and 2017 results (sum)
+{
+use "Applied analysis 3 - results.dta", clear 
+
+*Make the costs in billions
+foreach var of varlist median l95 u95 {
+	qui replace `var' = `var'/1000000000 if strpos(outcome,"cost") > 0
+}
+
+*Sort
+encode outcome , gen(sort)
+replace sort = -10 if sort == 5
+replace sort = 20 if sort == 2
+replace sort = 21 if sort == 3
+replace sort = 22 if sort == 4
+sort sort type
+drop sort
+
+replace outcome = outcome + " (£ billions)" if strpos(outcome, "cost") > 0
+
+rename outcome Outcome
+rename type Type
+
+save "$cd_tables\Supplementary Table 16", replace
+}
+
+*Supplementary table 17 - Changes in BMI between 1993 and 2017 results (per person)
+{
+use "Applied analysis 3 - results.dta", clear 
+
+foreach var of varlist median l95 u95 {
+	qui replace `var' = `var'/21742497
+}
+
+*Sort
+encode outcome , gen(sort)
+replace sort = -10 if sort == 5
+replace sort = 20 if sort == 2
+replace sort = 21 if sort == 3
+replace sort = 22 if sort == 4
+sort sort type
+drop sort
+
+rename outcome Outcome
+rename type Type
+
+drop if strpos(Outcome,"HES") > 0 | strpos(Outcome,"D4") > 0
+
+save "$cd_tables\Supplementary Table 17", replace
+
+}
+
+*Supplementary table 18 - Cost of being overweight/obese in 2017 (sum)
+{
+use "Applied analysis 4 - results.dta", clear 
+
+*Make the costs in billions
+foreach var of varlist median l95 u95 {
+	qui replace `var' = `var'/1000000000 if strpos(outcome,"cost") > 0
+}
+
+*Sort
+encode outcome , gen(sort)
+replace sort = -10 if sort == 5
+replace sort = 20 if sort == 2
+replace sort = 21 if sort == 3
+replace sort = 22 if sort == 4
+sort sort type
+drop sort
+
+replace outcome = outcome + " (£ billions)" if strpos(outcome, "cost") > 0
+
+rename outcome Outcome
+rename type Type
+
+save "$cd_tables\Supplementary Table 18", replace
+}
+
+*Supplementary table 19 - Cost of being overweight/obese in 2017 (per person)
+{
+use "Applied analysis 4 - results.dta", clear 
+
+foreach var of varlist median l95 u95 {
+	qui replace `var' = `var'/15565145 
+}
+
+*Sort
+encode outcome , gen(sort)
+replace sort = -10 if sort == 5
+replace sort = 20 if sort == 2
+replace sort = 21 if sort == 3
+replace sort = 22 if sort == 4
+sort sort type
+drop sort
+
+rename outcome Outcome
+rename type Type
+
+save "$cd_tables\Supplementary Table 19", replace
+
+}
+
+*To open
+{
+use "$cd_tables\Table 1.dta", clear
+use "$cd_tables\Table 2.dta", clear
+use "$cd_tables\Supplementary Table 1.dta", clear
+*use "$cd_tables\Supplementary Table 2.dta", clear //Not created in Stata
+use "$cd_tables\Supplementary Table 3.dta", clear
+use "$cd_tables\Supplementary Table 4.dta", clear
+
+use "$cd_tables\Supplementary Table 13.dta", clear
+use "$cd_tables\Supplementary Table 14.dta", clear
+use "$cd_tables\Supplementary Table 15.dta", clear
+use "$cd_tables\Supplementary Table 16.dta", clear
+use "$cd_tables\Supplementary Table 17.dta", clear
+use "$cd_tables\Supplementary Table 18.dta", clear
+use "$cd_tables\Supplementary Table 19.dta", clear
+}
+
+}
+
+*Part IX
+*Data for R graphs
+{
+
+*Summary MR analysis & plots in R (MR-Base)
+{
+*Main analysis
+use "MR data.dta", clear
+
+rename snp SNP
+rename beta beta_outcome
+rename se se_outcome
+rename p pval_outcome
+drop n
+
+gen id_exposure = "BMI"
+
+gen id_outcome = outcome
+
+export delim "$cd_graphs\mr_analysis.csv", replace delim(",")
+
+}
+
+********************************************************************************
+
+*Forest plots (in R)
+{
+
+use "$cd_tables\Results table (complete).dta", clear
+
+sort outcome type
+
+drop f_stat p p_endog
+
+gen l95 = beta-1.96*se, a(beta)
+gen u95 = beta+1.96*se, a(l95)
+
+*Remove all sensitivity analyses
+keep if exposure_time == "Any"
+keep if age == "all"
+drop if strpos(exposure,"(")>0
+keep if sex == "all" | (sex == "female" & (exposure == "Breast Cancer" | exposure == "Ovarian Cancer")) | (sex == "male" & exposure == "Prostate Cancer")
+drop if type == "Multivariable Adjusted - additional variables"
+drop exposure_time sex age 
+keep if outcome == "QALY-costs per year (£20k per QALY)" | outcome == "QALYs per year" | outcome == "Total healthcare costs per year"
+
+gen beta1 = ""
+
+local max = c(N)
+forvalues i = 1/`max' {
+	local beta = beta[`i']
+	local l95 = l95[`i']
+	local u95 = u95[`i']
+	if strpos(outcome[`i'],"costs") > 0 {
+		local beta: di %7.0fc `beta'
+		local beta = "£`beta'"
+		local beta = subinstr("`beta'","£-","-£",.)
+		local beta = subinstr("`beta'","  "," ",.)
+		local beta = subinstr("`beta'","  "," ",.)
+		local beta = subinstr("`beta'","  "," ",.)
+		local beta = subinstr("`beta'","£ ","£",.)
+		local l95: di %7.0fc `l95'
+		local l95 = "£`l95'"
+		local l95 = subinstr("`l95'","£-","-£",.)
+		local l95 = subinstr("`l95'","  "," ",.)
+		local l95 = subinstr("`l95'","  "," ",.)
+		local l95 = subinstr("`l95'","  "," ",.)
+		local l95 = subinstr("`l95'","£ ","£",.)
+		local u95: di %7.0fc `u95'
+		local u95 = "£`u95'"
+		local u95 = subinstr("`u95'","£-","-£",.)
+		local u95 = subinstr("`u95'","  "," ",.)
+		local u95 = subinstr("`u95'","  "," ",.)
+		local u95 = subinstr("`u95'","  "," ",.)
+		local u95 = subinstr("`u95'","  "," ",.)
+		local u95 = subinstr("`u95'","£ ","£",.)
+	}
+	else {
+		local beta = `beta'*100
+		local beta: di %3.2f `beta'
+		local beta = "`beta'%"
+		local l95 = `l95'*100
+		local l95: di %3.2f `l95'
+		local l95 = "`l95'%"
+		local u95 = `u95'*100
+		local u95: di %3.2f `u95'
+		local u95 = "`u95'%"
+	}
+	local beta = "`beta' (`l95' to `u95')"
+	qui replace beta1 = "`beta'" in `i'
+}
+
+*Change to percentages
+replace beta = 100*beta if strpos(outcome,"QALYs") > 0
+replace se = 100*se if strpos(outcome,"QALYs") > 0 
+
+replace l95 = beta-1.96*se
+replace u95 = beta+1.96*se
+
+rename l95 lower
+rename u95 upper
+
+*Generate plot groups
+*First plot: Alphabetically by cancer
+
+encode exposure, gen(plot_group_1)
+order outcome exposure plot_group_1 type 
+sort outcome plot_group type
+label drop plot_group_1
+
+save "$cd_tables\metan_r.dta", replace
+export delim "$cd_tables\metan_r.csv", delim(",") replace
+
+}
+}
+
+*Part X
+*Run the R script to create all R graphs
+{
+
+rsource using "$cd_r_code\graphs.R", rpath(`"C:\Program Files\R\R-3.5.1\bin\R.exe"') roptions(`"--vanilla"')
+
+}
+
+}
